@@ -20,8 +20,8 @@ window.FA_crearMotor = function (G) {
    - Un aporte a una meta es ahorro (no gasto); un retiro lo devuelve.
    ═══════════════════════════════════════════════════════════════════════ */
 
-const VERSION = "3.2";   // ver CAMBIOS.md
-const ESQUEMA = "1.3";
+const VERSION = "3.4";   // ver CAMBIOS.md
+const ESQUEMA = "1.4";
 
 const HOJA = { MOV: "Movimientos", CAT: "Categorías", METAS: "Metas", TARJ: "Tarjetas", DEUDAS: "Deudas", FIJOS: "Fijos", CONFIG: "Config" };
 
@@ -71,6 +71,7 @@ const CONFIG_CAMPOS = [
   ["valorUF", "numero", 0, "Valor de la UF a mano (0 = se trae solo cada día desde mindicador.cl)"],
   ["correoResumen", "texto", "", "Correo donde llega el resumen de cada mes, con PDF (vacío = no se envía)"],
   ["recordatorioHora", "numero", 0, "Hora del recordatorio diario por correo, solo si ese día no registraste nada (0 = no se envía)"],
+  ["suscripcionesNo", "texto", "", "Cobros que se repiten y que dijiste que no son fijos (no se vuelven a sugerir)"],
 ];
 
 /* ── utilidades ─────────────────────────────────────────────────────── */
@@ -458,6 +459,95 @@ function proximosPagos_(tarjetas, deudas, dias) {
     .sort((a, b) => a.dias - b.dias);
 }
 
+/* ── lo que cambió, cobros que se repiten y racha (3.4) ─────────────── */
+// Gasto por categoría de un período hasta su día "hastaDia" (0 = primer día). Lo comprado en el período cuenta
+// según su fecha; las cuotas de compras de meses anteriores cuentan siempre (se cobran ese período).
+function gastoHasta_(movs, indice, hastaDia, cfg) {
+  const desde = deIso_(rangoPeriodo_(indice, cfg.inicioMes).desde), out = {};
+  movs.forEach(m => {
+    let v = 0, c = m.categoria;
+    const enEste = indicePeriodo_(m.fecha, cfg.inicioMes) === indice;
+    if (m.tipo === "Gasto") { v = imputado_(m, indice, cfg.inicioMes); if (!v || (enEste && diasEntre_(desde, m.fecha) > hastaDia)) return; }
+    else if (m.tipo === "Pago deuda") { if (!enEste || diasEntre_(desde, m.fecha) > hastaDia) return; v = m.monto; c = CAT_DEUDAS; }
+    else return;
+    out[c] = (out[c] || 0) + v;
+  });
+  return out;
+}
+// Lo que más cambió frente al promedio de los 3 períodos anteriores (los que tienen movimientos), comparando
+// a la misma altura del mes (un mes pasado se compara completo). Desde el día 7, para que el ritmo diga algo.
+// Solo cambios que importan: ±20 % y al menos $5.000, en categorías con $10.000 o más. Hasta 2 alzas y 1 baja.
+function explicaciones_(indice, hoy, cfg) {
+  const movs = movimientos_(), actual = indicePeriodo_(hoy, cfg.inicioMes);
+  const dia = indice === actual ? diasEntre_(deIso_(rangoPeriodo_(indice, cfg.inicioMes).desde), hoy) : 40;
+  if (dia < 6) return [];
+  const usados = {}; movs.forEach(m => { usados[indicePeriodo_(m.fecha, cfg.inicioMes)] = true; });
+  const previos = [1, 2, 3].map(k => indice - k).filter(k => usados[k]);
+  if (!previos.length) return [];
+  const este = gastoHasta_(movs, indice, dia, cfg), suma = {};
+  previos.forEach(k => { const g = gastoHasta_(movs, k, dia, cfg); Object.keys(g).forEach(c => { suma[c] = (suma[c] || 0) + g[c]; }); });
+  const lista = [];
+  Object.keys(Object.assign({}, suma, este)).forEach(c => {
+    const a = Math.round(este[c] || 0), p = Math.round((suma[c] || 0) / previos.length), dif = a - p;
+    if (Math.max(a, p) < 10000 || Math.abs(dif) < 5000) return;
+    const pct = p > 0 ? Math.round(dif * 100 / p) : null;
+    if (pct !== null && Math.abs(pct) < 20) return;
+    lista.push({ categoria: c, actual: a, promedio: p, pct: pct, dif: dif, meses: previos.length, alDia: indice === actual });
+  });
+  return lista.filter(x => x.dif > 0).sort((x, y) => y.dif - x.dif).slice(0, 2)
+    .concat(lista.filter(x => x.dif < 0).sort((x, y) => x.dif - y.dif).slice(0, 1));
+}
+// Cobros que parecen mensuales y no están en Fijos: mismo monto, categoría y nota, una sola vez por período,
+// cerca del mismo día del mes (±5), en al menos 2 períodos seguidos, el último este período o el anterior.
+// Se ofrecen para pasarlos a Fijos; los que la persona descarta quedan en el ajuste suscripcionesNo.
+function claveSuscripcion_(m) { return [m.categoria, m.monto, texto_(m.nota).toLowerCase()].join("|").slice(0, 80); }
+function suscripciones_(hoy, cfg) {
+  const actual = indicePeriodo_(hoy, cfg.inicioMes), grupos = {};
+  let no = []; try { no = JSON.parse(cfg.suscripcionesNo || "[]"); } catch (e) { no = []; }
+  const fijos = fijos_().filter(f => f.activa && f.tipo === "Gasto");
+  movimientos_().forEach(m => {
+    if (m.tipo !== "Gasto" || m.fijo || m.cuotas > 1 || m.monto < 1000) return;
+    const k = indicePeriodo_(m.fecha, cfg.inicioMes); if (k < actual - 3 || k > actual) return;
+    const clave = claveSuscripcion_(m);
+    const g = grupos[clave] || (grupos[clave] = { clave: clave, categoria: m.categoria, monto: m.monto, nota: m.nota, medio: m.medio, por: {}, dias: [], ultima: 0 });
+    g.por[k] = (g.por[k] || 0) + 1; g.dias.push(partes_(m.fecha).d);
+    if (m.fecha.getTime() > g.ultima) { g.ultima = m.fecha.getTime(); g.medio = m.medio; }
+  });
+  return Object.keys(grupos).map(c => grupos[c]).filter(g => {
+    const ks = Object.keys(g.por).map(Number).sort((a, b) => a - b);
+    if (ks.some(k => g.por[k] > 1) || ks[ks.length - 1] < actual - 1) return false;   // varias veces al mes: es frecuente, no mensual
+    if (Math.max.apply(null, g.dias) - Math.min.apply(null, g.dias) > 5) return false;
+    let seguidos = 1; for (let i = ks.length - 1; i > 0 && ks[i] - ks[i - 1] === 1; i--) seguidos++;
+    g.veces = seguidos;
+    return seguidos >= 2 && no.indexOf(g.clave) < 0 && !fijos.some(f => f.categoria === g.categoria && Math.abs(f.monto - g.monto) <= f.monto * 0.15);
+  }).sort((a, b) => b.veces - a.veces || b.monto - a.monto).slice(0, 3)
+    .map(g => ({ clave: g.clave, categoria: g.categoria, monto: g.monto, nota: g.nota, medio: g.medio, dia: g.dias[g.dias.length - 1], veces: g.veces }));
+}
+function descartarSuscripcion(clave) {
+  olvidarLecturas_();
+  asegurarEstructura_();
+  const c = texto_(clave).slice(0, 80); if (!c) return falla_("No se encontró ese cobro.");
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  try {
+    const t = tabla_(HOJA.CONFIG), f = t.filas.find(x => texto_(x.Clave) === "suscripcionesNo");
+    let no = []; try { no = JSON.parse(f ? texto_(f.Valor) || "[]" : "[]"); } catch (e) { no = []; }
+    if (no.indexOf(c) < 0) no.push(c);
+    const v = JSON.stringify(no.slice(-30));
+    if (f) escribirFila_(t, f._fila, { "Valor": v }); else agregarFilas_(t, [{ "Clave": "suscripcionesNo", "Valor": v, "Descripción": CONFIG_CAMPOS.find(x => x[0] === "suscripcionesNo")[3] }]);
+  } finally { lock.releaseLock(); }
+  return { ok: true, datos: panelDatos() };
+}
+// Días seguidos con algo anotado, hasta hoy (o hasta ayer, si hoy todavía no hay nada)
+function racha_(hoy) {
+  const dias = {}; movimientos_().forEach(m => { const p = partes_(m.fecha); dias[p.a * 10000 + p.m * 100 + p.d] = true; });
+  const clave = d => { const p = partes_(d); return p.a * 10000 + p.m * 100 + p.d; };
+  const p0 = partes_(hoy); let d = new Date(p0.a, p0.m - 1, p0.d, 12, 0, 0), n = 0;
+  const hoyHay = !!dias[clave(d)];
+  if (!hoyHay) d = new Date(d.getFullYear(), d.getMonth(), d.getDate() - 1, 12, 0, 0);
+  while (dias[clave(d)] && n < 3660) { n++; d = new Date(d.getFullYear(), d.getMonth(), d.getDate() - 1, 12, 0, 0); }
+  return { dias: n, hoy: hoyHay };
+}
+
 /* ── API del panel (google.script.run) ──────────────────────────────── */
 function medios_() { return MEDIOS_BASE.concat(tarjetas_().filter(t => t.activa).map(t => t.nombre)); }
 // Todo lo que el panel necesita para pintarse
@@ -476,6 +566,7 @@ function panelDatos(indice) {
     categorias: categorias_().filter(c => c.activa).map(c => ({ nombre: c.nombre, tipo: c.tipo, icono: c.icono, color: c.color, presupuesto: c.presupuesto })),
     medios: medios_(), movimientos: movimientosPeriodo_(i, cfg), cuotasPeriodo: cuotasPeriodo_(i, cfg), historial: historial_(i, cfg), ejemplo: hayEjemplo_(),
     recientes: recientes_(hoy), urlRegistrar: urlPanel_() ? urlPanel_() + "?a=registrar" : "", frecuentes: frecuentes_(hoy), fijos: fijos,
+    explicaciones: explicaciones_(i, hoy, cfg), suscripciones: i === actual ? suscripciones_(hoy, cfg) : [], racha: racha_(hoy),
   };
 }
 // Categorías más usadas en los últimos 90 días, por tipo (el registro rápido las pone primero)
@@ -1202,6 +1293,13 @@ h2 button{font-size:13px;font-weight:600;color:var(--a);background:none;border:0
 .hero .tres div{background:rgba(255,255,255,.14);border-radius:12px;padding:8px 10px;min-width:0}
 .hero .tres span{display:block;font-size:12px;opacity:.92}
 .hero .tres b{font-size:15px;white-space:nowrap}
+.hero .racha{display:flex;align-items:center;gap:6px;margin:12px 0 0;font-size:13px;opacity:.95}.hero .racha i{font-size:17px;color:#FFD08A}
+.explica .fila .tx small.cmp{white-space:normal}
+.sus .fila{align-items:flex-start}.sus .fila .tx small{white-space:normal}
+.sus-b{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
+.sus-b button{min-height:40px;padding:0 14px;border-radius:12px;border:1px solid var(--b);background:var(--s);color:var(--a);font-weight:650;font-size:13.5px}
+.sus-b button:first-child{background:var(--a);border-color:var(--a);color:var(--s)}
+.scan-b{display:inline-flex;align-items:center;gap:8px;min-height:44px;margin:0 0 6px;padding:0 16px;border-radius:999px;border:1px solid var(--b);background:var(--s2);color:var(--a);font-weight:650;font-size:14px}.scan-b i{font-size:19px}
 .pres{padding:14px 16px;margin-top:12px}
 .pres-t{display:flex;justify-content:space-between;gap:10px;font-size:13.5px;color:var(--t2);margin-bottom:8px}
 .pres-t b{color:var(--t)}
@@ -1507,13 +1605,14 @@ function pintarInicio(){
   if (S.periodo === D.actual) h += htmlCola();
   h += '<div class="rejilla"><div>';
   h += '<div class="card hero"><small>Disponible · ' + esc(r.periodo.nombre) + '</small><div class="total num">' + clp(r.disponible) + '</div>'
-    + '<div class="tres"><div><span>Ingresos</span><b class="num">' + clp(r.ingresos) + '</b></div><div><span>Gastos</span><b class="num">' + clp(r.gastos) + '</b></div><div><span>Ahorro</span><b class="num">' + clp(r.ahorro) + '</b></div></div></div>';
+    + '<div class="tres"><div><span>Ingresos</span><b class="num">' + clp(r.ingresos) + '</b></div><div><span>Gastos</span><b class="num">' + clp(r.gastos) + '</b></div><div><span>Ahorro</span><b class="num">' + clp(r.ahorro) + '</b></div></div>' + htmlRacha() + '</div>';
   if (r.presupuestoTotal > 0) {
     var usado = r.presupuestoTotal - r.presupuestoRestante, pct = Math.min(100, Math.round(usado * 100 / r.presupuestoTotal));
     h += '<div class="card pres"><div class="pres-t"><span>Presupuesto del mes</span><span>Te quedan <b class="num">' + clp(r.presupuestoRestante) + '</b> de <span class="num">' + clp(r.presupuestoTotal) + '</span></span></div><div class="barra"><i class="' + (pct >= 100 ? 'excedido' : (pct >= D.config.alertaPct ? 'alerta' : 'okv')) + '" style="width:' + pct + '%"></i></div>' + porDia(r) + '</div>';
   }
   if (D.proyeccion && S.periodo === D.actual && D.proyeccion.dias > 0) h += htmlProyeccion(D.proyeccion);
   if (r.alertas.length) h += '<div class="alertas">' + r.alertas.map(function(a){ return '<div class="alerta-f ' + a.estado + '"><i class="ti ' + (a.estado === 'excedido' ? 'ti-alert-octagon' : 'ti-alert-triangle') + '"></i><span><b>' + esc(a.nombre) + '</b> · ' + (a.estado === 'excedido' ? 'te pasaste por ' + clp(-a.restante) : (a.restante <= 0 ? 'usaste todo el presupuesto' : 'vas en el ' + a.pct + ' %, te quedan ' + clp(a.restante))) + '</span></div>'; }).join('') + '</div>';
+  h += htmlExplica() + htmlSuscripciones();
   if (D.ejemplo) h += '<div class="ejemplo"><i class="ti ti-flask" aria-hidden="true"></i><span>Estás viendo <b>datos de ejemplo</b>.</span><button onclick="verMas(3)">Borrar</button></div>';
   if (!D.movimientos.length && S.periodo === D.actual && !D.ejemplo) h += pasosInicio();
   if (D.proximos.length) {
@@ -1536,6 +1635,47 @@ function pintarInicio(){
   h += '</div></div>';
   el('v-inicio').innerHTML = h;
 }
+// Días seguidos anotando (3.4): solo en el mes en curso y desde 3 días, sin presionar
+function htmlRacha(){
+  var r = D.racha; if (!r || r.dias < 3 || S.periodo !== D.actual) return '';
+  return '<p class="racha"><i class="ti ti-flame" aria-hidden="true"></i><span>' + r.dias + ' días seguidos anotando' + (r.hoy ? '' : ' · anota algo hoy para seguir') + '</span></p>';
+}
+// Lo que cambió frente a los meses anteriores, en palabras (3.4). Tocar = ver esa categoría
+function htmlExplica(){
+  var xs = D.explicaciones || []; if (!xs.length) return '';
+  return '<h2>Lo que cambió</h2><div class="card lista explica">' + xs.map(function(x){
+    var c = cat(x.categoria), t;
+    if (x.promedio > 0) t = Math.abs(x.pct) + ' % ' + (x.dif > 0 ? 'más' : 'menos') + ' que tu promedio' + (x.alDia ? ' a esta altura del mes' : '') + ' (' + clp(x.promedio) + ')';
+    else t = (x.meses === 1 ? 'El mes anterior' : 'Los ' + x.meses + ' meses anteriores') + ' no gastaste aquí';
+    if (x.meses === 1 && x.promedio > 0) t = t.replace('tu promedio', 'el mes anterior');
+    return '<button class="fila toca" onclick="verCategoria(this.getAttribute(&#39;data-v&#39;))" data-v="' + esc(x.categoria) + '">' + ico(c.icono, c.color) + '<span class="tx"><b>' + esc(x.categoria) + '</b><small class="cmp ' + (x.dif > 0 ? 'sube' : 'baja') + '">' + esc(t) + '</small></span><span class="v num">' + clp(x.actual) + '</span></button>';
+  }).join('') + '</div>';
+}
+// Cobros que se repiten cada mes y no están en Fijos (3.4): pasarlos a Fijos o descartarlos
+function htmlSuscripciones(){
+  var xs = D.suscripciones || []; if (!xs.length || S.periodo !== D.actual) return '';
+  return '<h2>¿Son gastos fijos?</h2><div class="card lista sus">' + xs.map(function(x, k){
+    var c = cat(x.categoria);
+    return '<div class="fila">' + ico(c.icono, c.color) + '<span class="tx"><b>' + esc(x.nota || x.categoria) + '</b><small>' + clp(x.monto) + ' · se repite hace ' + x.veces + ' meses, cerca del día ' + x.dia + '</small><span class="sus-b"><button onclick="suscripcionAFijo(' + k + ')">Pasar a fijos</button><button onclick="noEsFijo(' + k + ', this)">No es fijo</button></span></span></div>';
+  }).join('') + '</div>';
+}
+function suscripcionAFijo(k){ var x = (D.suscripciones || [])[k]; if (x) formFijo('', { nombre: x.nota || x.categoria, monto: x.monto, dia: x.dia, categoria: x.categoria, medio: x.medio }); }
+function noEsFijo(k, b){ var x = (D.suscripciones || [])[k]; if (!x) return; api('descartarSuscripcion', [x.clave], function(r){ if (!r.ok) { toast(r.error); return; } pintar(r.datos); toast('Listo, no lo vuelvo a sugerir'); }, b); }
+// Boleta o factura electrónica (3.4, solo en la app del teléfono): el lector (FA_escanear) devuelve monto, fecha y comercio
+function escanearBoleta(){
+  if (!window.FA_escanear) return;
+  window.FA_escanear(function(b){
+    if (!S.reg) return;
+    if (!b || !b.ok) { toast((b && b.error) || 'No pude leer la boleta.'); return; }
+    S.reg.monto = String(b.monto); S.reg.montoAuto = false;
+    if (b.fecha && b.fecha <= D.hoy) S.reg.fecha = b.fecha;
+    if (b.nota && !S.reg.nota) S.reg.nota = b.nota;
+    S.reg.det = true; pintarRegistro();
+    toast('Boleta leída: ' + clp(b.monto) + '. Elige la categoría.');
+  });
+}
+// Vibración corta al guardar (3.4): la app nativa usa el motor del teléfono (FA_vibrar); el navegador, si puede
+function vibrar(){ try { if (window.FA_vibrar) window.FA_vibrar(); else if (navigator.vibrate) navigator.vibrate(12); } catch (e) {} }
 // Cuánto se puede gastar por día con lo que queda del presupuesto (solo el mes en curso)
 // "Si sigues a este ritmo": montos redondeados a mil, porque es una estimación
 function mil(n){ return Math.round(n / 1000) * 1000; }
@@ -1808,6 +1948,7 @@ function pintarRegistro(){
   var fj = r.fijo ? buscar(D.fijos, r.fijo) : null;
   if (fj && fj.id) h += '<div style="text-align:center"><span class="fijo-et"><i class="ti ti-repeat"></i>Fijo: ' + esc(fj.nombre) + '</span></div>';
   h += '<div class="monto num' + (r.monto ? '' : ' vacio-m') + '" id="montoV" aria-live="polite">' + clp(r.monto || 0) + '</div>';
+  if (window.FA_escanear && !r.id && r.tipo === 'Gasto' && !r.fijo) h += '<div style="text-align:center"><button type="button" class="scan-b" onclick="escanearBoleta()"><i class="ti ti-scan" aria-hidden="true"></i>Escanear boleta</button></div>';
   var rep = rapido && !r.monto && !r.fijo ? (D.recientes || []).filter(function(x){ return x.tipo === r.tipo; }) : [];
   if (rep.length) h += '<div class="rep" aria-label="Repetir lo habitual"><span class="rep-t">Repetir</span>' + rep.map(function(x, k){ var c = cat(x.categoria); return '<button type="button" class="rep-b" onclick="repetir(' + (D.recientes.indexOf(x)) + ')"><span class="rep-i" style="background:' + esc(c.color) + '"><i class="ti ' + esc(c.icono) + '"></i></span>' + esc(x.nota || x.categoria) + ' <b class="num">' + clp(x.monto) + '</b></button>'; }).join('') + '</div>';
   h += '<div class="teclado">' + ['1','2','3','4','5','6','7','8','9','000','0','borrar'].map(function(k){ return '<button type="button" onclick="tecla(&#39;' + k + '&#39;)" aria-label="' + (k === 'borrar' ? 'Borrar' : k) + '">' + (k === 'borrar' ? '<i class="ti ti-backspace"></i>' : k) + '</button>'; }).join('') + '</div>';
@@ -1913,6 +2054,7 @@ function guardarRegistro(){
   var fin = function(res){
     if (!res.ok) { reabrirRegistro(copia, res.error); return; }
     if (d.categoria) guardarLocal('cat_' + d.tipo, d.categoria);
+    vibrar();
     pintar(res.datos);
     if (copia.id) toast('Movimiento actualizado', function(){ api('editarMovimiento', [copia.id, antes], deshecho, null, sinDeshacer); });
     else toast(copia.tipo === 'Pago' ? 'Pago registrado' : 'Listo, registrado', function(){ api('borrarMovimiento', [res.id, S.periodo], deshecho, null, sinDeshacer); });
@@ -2030,8 +2172,8 @@ function formDeuda(id){
 }
 function ufTxt(n){ return n === null || n === undefined || n === '' ? '' : Number(n).toLocaleString('es-CL', { maximumFractionDigits: 4 }); }
 function esIngreso(nombre){ return D.categorias.some(function(c){ return c.nombre === nombre && c.tipo === 'Ingreso'; }); }
-function formFijo(id){
-  var x = buscar(D.fijos, id);
+function formFijo(id, pre){
+  var x = buscar(D.fijos, id); if (!id && pre) x = pre;
   var grupos = [['Gasto','Gastos'],['Ingreso','Ingresos']].map(function(g){ return { grupo: g[1], items: D.categorias.filter(function(c){ return c.tipo === g[0] && c.nombre !== 'Deudas'; }).map(function(c){ return { v: c.nombre, t: c.nombre }; }) }; });
   formulario(id ? 'Editar fijo' : 'Nuevo gasto o ingreso fijo', [['nombre','Nombre (ej: Arriendo, Luz, Netflix, Sueldo)',x.nombre || '','text'],['monto','Monto de un mes normal',x.monto || '','numero'],['dia','Día del mes en que se paga o llega (1 a 31)',x.dia || '','numero'],['categoria','Categoría',x.categoria || 'Casa','select',grupos],['medio','Cómo lo pagas (solo para gastos)',x.medio || leerLocal('medio') || 'Débito','select',D.medios.map(function(m){ return { v: m, t: m }; })]], 'guardarFijo', { id: id || '' }, 'fijo', function(d){ d.tipo = esIngreso(d.categoria) ? 'Ingreso' : 'Gasto'; });
 }
@@ -2155,7 +2297,7 @@ google.script.url.getLocation(function(loc){
 `;
 }
 
-  var PERMITIDAS_APP_ = { panelDatos: panelDatos, registrar: registrar, editarMovimiento: editarMovimiento, borrarMovimiento: borrarMovimiento, guardarCategorias: guardarCategorias, guardarCategoria: guardarCategoria, quitarCategoria: quitarCategoria, guardarPresupuestos: guardarPresupuestos, guardarConfig: guardarConfig, quitar: quitar, cargarEjemplo: cargarEjemplo, borrarEjemplo: borrarEjemplo, guardarMeta: guardarMeta, guardarTarjeta: guardarTarjeta, guardarDeuda: guardarDeuda, guardarFijo: guardarFijo };
+  var PERMITIDAS_APP_ = { panelDatos: panelDatos, registrar: registrar, editarMovimiento: editarMovimiento, borrarMovimiento: borrarMovimiento, guardarCategorias: guardarCategorias, guardarCategoria: guardarCategoria, quitarCategoria: quitarCategoria, guardarPresupuestos: guardarPresupuestos, guardarConfig: guardarConfig, quitar: quitar, cargarEjemplo: cargarEjemplo, borrarEjemplo: borrarEjemplo, guardarMeta: guardarMeta, guardarTarjeta: guardarTarjeta, guardarDeuda: guardarDeuda, guardarFijo: guardarFijo, descartarSuscripcion: descartarSuscripcion };
   return {
     VERSION: VERSION, HOJA: HOJA, CABECERAS: CABECERAS, EJ: EJ_,
     llamar: function (nombre, args) {

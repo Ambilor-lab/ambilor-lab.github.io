@@ -15,7 +15,7 @@
     { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
   ],
   "shortcuts": [
-    { "name": "Anotar gasto", "short_name": "Gasto", "url": "./?a=registrar&tipo=Gasto", "icons": [{ "src": "icons/atajo-gasto.png", "sizes": "96x96", "type": "image/png" }] },
-    { "name": "Anotar ingreso", "short_name": "Ingreso", "url": "./?a=registrar&tipo=Ingreso", "icons": [{ "src": "icons/atajo-ingreso.png", "sizes": "96x96", "type": "image/png" }] }
+    { "name": "Anotar gasto", "short_name": "Gasto", "url": "./?a=anotar&tipo=Gasto", "icons": [{ "src": "icons/atajo-gasto.png", "sizes": "96x96", "type": "image/png" }] },
+    { "name": "Anotar ingreso", "short_name": "Ingreso", "url": "./?a=anotar&tipo=Ingreso", "icons": [{ "src": "icons/atajo-ingreso.png", "sizes": "96x96", "type": "image/png" }] }
   ]
 }
