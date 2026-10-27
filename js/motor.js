@@ -20,7 +20,7 @@ window.FA_crearMotor = function (G) {
    - Un aporte a una meta es ahorro (no gasto); un retiro lo devuelve.
    ═══════════════════════════════════════════════════════════════════════ */
 
-const VERSION = "3.0";   // ver CAMBIOS.md
+const VERSION = "3.1";   // ver CAMBIOS.md
 const ESQUEMA = "1.3";
 
 const HOJA = { MOV: "Movimientos", CAT: "Categorías", METAS: "Metas", TARJ: "Tarjetas", DEUDAS: "Deudas", FIJOS: "Fijos", CONFIG: "Config" };
@@ -1479,7 +1479,7 @@ function api(fn, args, ok, boton, falla){
 function cargar(p){ api('panelDatos', [p === undefined ? null : p], pintar); }
 function pintar(d, guardada){
   if (!d || !d.ok) { toast((d && d.error) || 'No se pudo cargar'); return; }
-  if (!guardada && d.resumen.periodo.indice === d.actual) guardarLocal('datos', JSON.stringify(d));
+  if (!guardada && !LOCAL && d.resumen.periodo.indice === d.actual) guardarLocal('datos', JSON.stringify(d));
   D = d; S.periodo = d.resumen.periodo.indice;
   el('saludo').textContent = d.config.nombre ? 'Hola, ' + d.config.nombre : 'Mis Finanzas';
   el('perNom').textContent = d.resumen.periodo.nombre;
@@ -2045,7 +2045,7 @@ function vistaFijos(){
 // Abre al instante con lo último que se vio en este teléfono y lo actualiza al llegar la respuesta
 (function(){
   var h = new Date(), hoy = h.getFullYear() + '-' + ('0' + (h.getMonth() + 1)).slice(-2) + '-' + ('0' + h.getDate()).slice(-2);
-  try { var g = JSON.parse(leerLocal('datos') || 'null'); if (g && g.ok && g.version === VERSION_PANEL && g.hoy === hoy) pintar(g, true); } catch (e) {}
+  if (!LOCAL) try { var g = JSON.parse(leerLocal('datos') || 'null'); if (g && g.ok && g.version === VERSION_PANEL && g.hoy === hoy) pintar(g, true); } catch (e) {}
   cargar();
 })();
 </script>

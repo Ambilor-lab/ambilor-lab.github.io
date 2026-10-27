@@ -309,7 +309,7 @@ small.cmp.sube{color:var(--warn)}small.cmp.baja{color:var(--ok)}
 </div>
 <div class="toast" id="toast"></div>
 <script>
-var D = null, S = { vista: 'inicio', periodo: null, masTab: 0, reg: null, ocupado: false, filtro: '', q: '' }, VERSION_PANEL = '3.0', ACCION_PANEL = window.FA_ACCION || '', LOCAL = !!window.FA_LOCAL;
+var D = null, S = { vista: 'inicio', periodo: null, masTab: 0, reg: null, ocupado: false, filtro: '', q: '' }, VERSION_PANEL = '3.1', ACCION_PANEL = window.FA_ACCION || '', LOCAL = !!window.FA_LOCAL;
 function el(id){ return document.getElementById(id); }
 function esc(s){ return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function clp(n){ var v = Math.round(Number(n) || 0); return (v < 0 ? '−' : '') + '$' + Math.abs(v).toLocaleString('es-CL'); }
@@ -338,7 +338,7 @@ function api(fn, args, ok, boton, falla){
 function cargar(p){ api('panelDatos', [p === undefined ? null : p], pintar); }
 function pintar(d, guardada){
   if (!d || !d.ok) { toast((d && d.error) || 'No se pudo cargar'); return; }
-  if (!guardada && d.resumen.periodo.indice === d.actual) guardarLocal('datos', JSON.stringify(d));
+  if (!guardada && !LOCAL && d.resumen.periodo.indice === d.actual) guardarLocal('datos', JSON.stringify(d));
   D = d; S.periodo = d.resumen.periodo.indice;
   el('saludo').textContent = d.config.nombre ? 'Hola, ' + d.config.nombre : 'Mis Finanzas';
   el('perNom').textContent = d.resumen.periodo.nombre;
@@ -904,7 +904,7 @@ function vistaFijos(){
 // Abre al instante con lo último que se vio en este teléfono y lo actualiza al llegar la respuesta
 (function(){
   var h = new Date(), hoy = h.getFullYear() + '-' + ('0' + (h.getMonth() + 1)).slice(-2) + '-' + ('0' + h.getDate()).slice(-2);
-  try { var g = JSON.parse(leerLocal('datos') || 'null'); if (g && g.ok && g.version === VERSION_PANEL && g.hoy === hoy) pintar(g, true); } catch (e) {}
+  if (!LOCAL) try { var g = JSON.parse(leerLocal('datos') || 'null'); if (g && g.ok && g.version === VERSION_PANEL && g.hoy === hoy) pintar(g, true); } catch (e) {}
   cargar();
 })();
 </script>

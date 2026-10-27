@@ -2,14 +2,13 @@
 // El panel (index.html) y las reglas (motor.js) son los mismos de la versión de Google; este archivo:
 //   · reemplaza google.script.run: cada llamada corre en el motor local y la "planilla" se guarda en el teléfono (IndexedDB);
 //   · atajos: ?a=registrar (abre el registro), con tipo/monto/categoria/medio/nota, y guardar=1 para anotar directo;
-//   · respaldo en archivo (con aviso), bloqueo con PIN y envío opcional de movimientos a la planilla de Google.
+//   · clave obligatoria: los datos se guardan CIFRADOS (AES-256-GCM); la llave de datos va cifrada con la clave (PBKDF2);
+//   · respaldo en archivo cifrado con contraseña (con aviso) y envío opcional de movimientos a la planilla de Google.
 (function () {
   "use strict";
   window.FA_LOCAL = true;
-  // Si hay PIN, la pantalla parte tapada (sin dejar ver los datos ni un instante)
-  let pinMarcado = false;
-  try { pinMarcado = localStorage.getItem("fa_pin_on") === "1"; } catch (e) {}
-  if (pinMarcado) document.documentElement.classList.add("fa-bloqueada");
+  // La pantalla parte tapada hasta poner la clave (sin dejar ver nada ni un instante)
+  document.documentElement.classList.add("fa-bloqueada");
   document.write("<style>.fa-bloqueada body>*:not(#fa-bloqueo){visibility:hidden}</style>");
 
   const BASE = "mis-finanzas-telefono", ALMACEN = "kv";
@@ -17,7 +16,7 @@
   const RE_PANEL = /^https:\/\/script\.google\.com\/(macros|a\/macros\/[^/?#]+)\/s\/[\w-]+\/exec$/;
   const SOLO_LECTURA = { panelDatos: true };
 
-  const E = { motor: null, ss: null, props: null, pin: null, respaldo: "", planilla: "", enviados: {}, errores: [], avisoRetorno: "" };
+  const E = { motor: null, ss: null, props: null, dek: null, llave: null, respaldo: "", planilla: "", enviados: {}, errores: [], avisoRetorno: "" };
   const esc = s => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   const hoyIso = () => { const h = new Date(); return h.getFullYear() + "-" + String(h.getMonth() + 1).padStart(2, "0") + "-" + String(h.getDate()).padStart(2, "0"); };
   const avisar = (t, fn, txt) => { if (typeof window.toast === "function") window.toast(t, fn, txt); };
@@ -43,6 +42,39 @@
   const leer = k => kv("readonly", o => o.get(k));
   const escribir = (k, v) => kv("readwrite", o => o.put(v, k));
 
+  /* ── cifrado (Web Crypto) ── */
+  // Una llave de datos al azar (AES-256-GCM) cifra lo guardado; esa llave se guarda envuelta con una llave que sale
+  // de la clave (PBKDF2-SHA256). Cambiar la clave solo vuelve a envolver la llave de datos.
+  const ITER = 600000, MIN_CLAVE = 6, MIN_RESPALDO = 8;
+  const enc = new TextEncoder(), dec = new TextDecoder();
+  function b64(buf) { const u = new Uint8Array(buf); let t = ""; for (let i = 0; i < u.length; i += 0x8000) t += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000)); return btoa(t); }
+  function deB64(t) { const s = atob(t), u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; }
+  const azar = n => crypto.getRandomValues(new Uint8Array(n));
+  async function derivar(clave, sal, iter) {
+    const base = await crypto.subtle.importKey("raw", enc.encode(String(clave).normalize("NFC")), "PBKDF2", false, ["deriveKey"]);
+    return crypto.subtle.deriveKey({ name: "PBKDF2", salt: sal, iterations: iter, hash: "SHA-256" }, base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt", "wrapKey", "unwrapKey"]);
+  }
+  async function cifrar(llave, texto) {
+    const iv = azar(12), ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, llave, enc.encode(texto));
+    return { iv: b64(iv), ct: b64(ct) };
+  }
+  async function descifrar(llave, o) { return dec.decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv: deB64(o.iv) }, llave, deB64(o.ct))); }
+  async function envolver(dek, clave) {
+    const sal = azar(16), iv = azar(12), kek = await derivar(clave, sal, ITER);
+    return { v: 1, kdf: "PBKDF2-SHA256", iter: ITER, sal: b64(sal), iv: b64(iv), envuelta: b64(await crypto.subtle.wrapKey("raw", dek, kek, { name: "AES-GCM", iv: iv })) };
+  }
+  // Falla (clave equivocada) si la llave envuelta no se puede abrir: AES-GCM verifica la integridad
+  async function desenvolver(llave, clave, exportable) {
+    const kek = await derivar(clave, deB64(llave.sal), llave.iter);
+    return crypto.subtle.unwrapKey("raw", deB64(llave.envuelta), kek, { name: "AES-GCM", iv: deB64(llave.iv) }, { name: "AES-GCM" }, !!exportable, ["encrypt", "decrypt"]);
+  }
+  async function crearLlave(clave) {
+    const dek = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+    const llave = await envolver(dek, clave);
+    await escribir("llave", llave);
+    return { llave: llave, dek: await desenvolver(llave, clave, false) };   // en memoria queda una copia no exportable
+  }
+
   /* ── la planilla en memoria ⇄ el teléfono ── */
   function aGuardar(ss) {
     return ss.hojas.map(h => ({ nombre: h.nombre, oculta: !!h.oculta,
@@ -54,8 +86,8 @@
   }
   let cadena = Promise.resolve();
   function guardarLibro() {
-    const copia = { hojas: aGuardar(E.ss), props: E.props.getProperties(), guardado: new Date().toISOString() };
-    cadena = cadena.then(() => escribir("libro", copia)).catch(err => {
+    const texto = JSON.stringify({ hojas: aGuardar(E.ss), props: E.props.getProperties(), guardado: new Date().toISOString() });
+    cadena = cadena.then(() => cifrar(E.dek, texto)).then(o => escribir("libroCifrado", o)).catch(err => {
       console.error(err);
       avisar("No se pudo guardar en el teléfono. Haz un respaldo ahora.", () => FALocal.respaldar(), "Respaldar");
     });
@@ -97,17 +129,27 @@
   }
 
   const listo = (async () => {
-    let guardado = null;
+    let viejo = null, cifrado = null;
+    try { localStorage.removeItem("fa_datos"); localStorage.removeItem("fa_pin_on"); } catch (e) {}   // copias sin cifrar de versiones anteriores
     try {
-      guardado = await leer("libro");
-      const [pin, respaldo, planilla, enviados, errores] = await Promise.all(["pin", "respaldo", "planilla", "enviados", "envioErrores"].map(leer));
-      Object.assign(E, { pin: pin || null, respaldo: respaldo || "", planilla: planilla || "", enviados: enviados || {}, errores: errores || [] });
+      const [llave, libroViejo, libroCifrado, respaldo, planilla, enviados, errores] =
+        await Promise.all(["llave", "libro", "libroCifrado", "respaldo", "planilla", "enviados", "envioErrores"].map(leer));
+      Object.assign(E, { llave: llave || null, respaldo: respaldo || "", planilla: planilla || "", enviados: enviados || {}, errores: errores || [] });
+      viejo = libroViejo || null; cifrado = libroCifrado || null;
       if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
     } catch (err) {
       console.error(err);
       setTimeout(() => avisar("Este navegador no deja guardar datos (¿modo incógnito?). Lo que anotes se perderá al cerrar."), 1500);
     }
+    await new Promise(r => (document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", r) : r()));
+    E.dek = await pedirClave(E.llave ? "abrir" : "crear", !!viejo);
+    let guardado = viejo;
+    if (cifrado) guardado = JSON.parse(await descifrar(E.dek, cifrado));
     crearLibro(guardado);
+    if (viejo) {   // los datos de antes de 3.1 (sin cifrar) se cifran y se borra la copia legible
+      await guardarLibro(); await kv("readwrite", o => o.delete("libro")); await kv("readwrite", o => o.delete("pin"));
+    }
+    desbloquearPantalla();
     await traerUF();
     await procesarRetorno();
     await atajoDirecto();
@@ -178,53 +220,96 @@
     return h.datos.slice(1).filter(f => f && f[0] && (!propios || String(f[0]).indexOf(E.motor.EJ) !== 0)).length;
   }
   function nombreArchivo() { return "mis-finanzas-respaldo-" + hoyIso() + ".json"; }
-  function datosRespaldo() {
-    return JSON.stringify({ app: "Mis Finanzas", formato: 1, version: E.motor.VERSION, creado: new Date().toISOString(),
-      movimientos: contarMovs(false), hojas: aGuardar(E.ss), props: E.props.getProperties() });
+  // formato 2: todo el contenido cifrado con la contraseña del respaldo (afuera solo va la fecha)
+  async function datosRespaldo(contrasena) {
+    const sal = azar(16), llave = await derivar(contrasena, sal, ITER);
+    const interior = JSON.stringify({ version: E.motor.VERSION, movimientos: contarMovs(false), hojas: aGuardar(E.ss), props: E.props.getProperties() });
+    const o = await cifrar(llave, interior);
+    return JSON.stringify({ app: "Mis Finanzas", formato: 2, creado: new Date().toISOString(),
+      cifrado: { alg: "AES-256-GCM", kdf: "PBKDF2-SHA256", iter: ITER, sal: b64(sal), iv: o.iv }, datos: o.ct });
+  }
+  function respaldoValido(r) {
+    return r && Array.isArray(r.hojas) && r.hojas.some(h => h && h.nombre === "Movimientos") && r.hojas.every(h => h && typeof h.nombre === "string" && Array.isArray(h.datos));
+  }
+  async function aplicarRespaldo(r, creado) {
+    const cuando = creado ? new Date(creado).toLocaleDateString("es-CL", { day: "numeric", month: "long", year: "numeric" }) : "fecha desconocida";
+    if (!confirm("Esto reemplaza todo lo que hay en este teléfono por el respaldo del " + cuando + " (" + (r.movimientos || 0) + " movimientos). ¿Seguir?")) return;
+    const texto = JSON.stringify({ hojas: r.hojas, props: r.props && typeof r.props === "object" ? r.props : {}, guardado: new Date().toISOString() });
+    await escribir("libroCifrado", await cifrar(E.dek, texto));
+    await escribir("respaldo", creado || new Date().toISOString());
+    location.reload();
   }
   async function marcarRespaldo() {
     E.respaldo = new Date().toISOString(); await escribir("respaldo", E.respaldo);
     refrescarAjustes(); avisar("Respaldo listo. Guárdalo fuera del teléfono (Drive, correo, computador).");
   }
 
-  /* ── PIN ── */
-  async function hashPin(pin, sal) {
-    const b = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(sal + ":" + pin));
-    return Array.from(new Uint8Array(b), x => x.toString(16).padStart(2, "0")).join("");
-  }
+  /* ── clave (obligatoria) ── */
   let fallos = 0, esperarHasta = 0, ocultoDesde = 0;
-  function bloquear() {
-    if (!E.pin) { document.documentElement.classList.remove("fa-bloqueada"); return; }
-    if (document.getElementById("fa-bloqueo")) return;
-    const v = document.createElement("div");
-    v.id = "fa-bloqueo"; v.setAttribute("role", "dialog"); v.setAttribute("aria-modal", "true"); v.setAttribute("aria-label", "Mis Finanzas bloqueada");
-    v.innerHTML = '<div class="fa-bl-caja"><span class="fa-bl-logo">F.</span><h1>Mis Finanzas</h1><p id="fa-bl-msg">Escribe tu PIN</p>' +
-      '<form id="fa-bl-form" autocomplete="off"><input id="fa-bl-pin" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" aria-label="PIN" autocomplete="off">' +
-      '<button type="submit">Entrar</button></form><button type="button" id="fa-bl-olvide" class="fa-bl-link">Olvidé mi PIN</button></div>';
-    document.body.appendChild(v);
-    document.documentElement.classList.add("fa-bloqueada");
-    const input = v.querySelector("#fa-bl-pin");
-    setTimeout(() => input.focus(), 50);
-    v.querySelector("#fa-bl-form").addEventListener("submit", async e => {
-      e.preventDefault();
-      const msg = v.querySelector("#fa-bl-msg");
-      if (Date.now() < esperarHasta) { msg.textContent = "Espera " + Math.ceil((esperarHasta - Date.now()) / 1000) + " s para intentar de nuevo"; return; }
-      if (await hashPin(input.value, E.pin.sal) === E.pin.hash) { fallos = 0; v.remove(); document.documentElement.classList.remove("fa-bloqueada"); return; }
-      fallos++; input.value = "";
-      if (fallos >= 5) { esperarHasta = Date.now() + 30000; fallos = 0; msg.textContent = "Demasiados intentos: espera 30 s"; }
-      else msg.textContent = "PIN incorrecto";
-    });
-    v.querySelector("#fa-bl-olvide").addEventListener("click", async () => {
-      if (!confirm("El PIN no se puede recuperar: protege tus datos en este teléfono.\n\nPuedes borrar todo y empezar de nuevo (o restaurar un respaldo después). ¿Borrar todos los datos de Mis Finanzas en este teléfono?")) return;
-      if (!confirm("¿Seguro? Esto no se puede deshacer.")) return;
-      await kv("readwrite", o => o.clear());
-      try { Object.keys(localStorage).filter(k => k.indexOf("fa_") === 0).forEach(k => localStorage.removeItem(k)); } catch (e) {}
-      location.reload();
+  function desbloquearPantalla() {
+    const v = document.getElementById("fa-bloqueo"); if (v) v.remove();
+    document.documentElement.classList.remove("fa-bloqueada");
+  }
+  function debil(c) { return /^[0-9]+$/.test(c) && c.length < 10; }
+  // modo "crear" (primera vez o datos sin cifrar de antes) o "abrir"; resuelve con la llave de datos
+  function pedirClave(modo, hayDatos) {
+    return new Promise(resolver => {
+      const v = document.createElement("div");
+      v.id = "fa-bloqueo"; v.setAttribute("role", "dialog"); v.setAttribute("aria-modal", "true"); v.setAttribute("aria-labelledby", "fa-bl-t");
+      const crear = modo === "crear";
+      v.innerHTML = '<div class="fa-bl-caja"><span class="fa-bl-logo">F.</span><h1 id="fa-bl-t">' + (crear ? "Crea tu clave" : "Mis Finanzas") + "</h1>" +
+        '<p id="fa-bl-msg" aria-live="polite">' + (crear ? (hayDatos ? "Tus datos se cifrarán con esta clave." : "Cifra tus datos en este teléfono.") + " Mínimo " + MIN_CLAVE + " caracteres." : "Escribe tu clave") + "</p>" +
+        '<form id="fa-bl-form" autocomplete="off">' +
+        '<input id="fa-bl-pin" type="password" inputmode="numeric" autocomplete="' + (crear ? "new-password" : "current-password") + '" aria-label="Clave">' +
+        (crear ? '<input id="fa-bl-pin2" type="password" inputmode="numeric" autocomplete="new-password" aria-label="Repite la clave" placeholder="Repite la clave">' : "") +
+        '<button type="submit" id="fa-bl-ok">' + (crear ? "Crear clave" : "Entrar") + "</button></form>" +
+        '<button type="button" id="fa-bl-letras" class="fa-bl-link">Usar letras y números</button>' +
+        (crear ? '<p class="fa-bl-nota">Si olvidas la clave, tus datos no se pueden recuperar: solo restaurando un respaldo. Con letras y números es mucho más segura.</p>'
+               : '<button type="button" id="fa-bl-olvide" class="fa-bl-link">Olvidé mi clave</button>') + "</div>";
+      document.body.appendChild(v);
+      document.documentElement.classList.add("fa-bloqueada");
+      const $ = id => v.querySelector("#" + id), msg = $("fa-bl-msg"), boton = $("fa-bl-ok");
+      setTimeout(() => $("fa-bl-pin").focus(), 50);
+      $("fa-bl-letras").addEventListener("click", () => {
+        const letras = $("fa-bl-pin").getAttribute("inputmode") === "numeric";
+        v.querySelectorAll("input").forEach(x => x.setAttribute("inputmode", letras ? "text" : "numeric"));
+        $("fa-bl-letras").textContent = letras ? "Usar solo números" : "Usar letras y números";
+        $("fa-bl-pin").focus();
+      });
+      if (!crear) $("fa-bl-olvide").addEventListener("click", async () => {
+        if (!confirm("La clave no se puede recuperar: sin ella, los datos cifrados de este teléfono no se pueden leer.\n\nPuedes borrar todo y empezar de nuevo (y después restaurar un respaldo). ¿Borrar todos los datos de Mis Finanzas en este teléfono?")) return;
+        if (!confirm("¿Seguro? Esto no se puede deshacer.")) return;
+        await kv("readwrite", o => o.clear());
+        try { Object.keys(localStorage).filter(k => k.indexOf("fa_") === 0).forEach(k => localStorage.removeItem(k)); } catch (e) {}
+        location.reload();
+      });
+      $("fa-bl-form").addEventListener("submit", async e => {
+        e.preventDefault();
+        const clave = $("fa-bl-pin").value;
+        if (crear) {
+          if (clave.length < MIN_CLAVE) { msg.textContent = "La clave debe tener al menos " + MIN_CLAVE + " caracteres."; return; }
+          if (clave !== $("fa-bl-pin2").value) { msg.textContent = "Las dos claves no coinciden."; return; }
+          boton.disabled = true; boton.textContent = "Cifrando…";
+          const r = await crearLlave(clave); E.llave = r.llave;
+          if (debil(clave)) setTimeout(() => avisar("Clave creada. Para más seguridad, cámbiala por una con letras y números (Más → Ajustes)."), 2500);
+          resolver(r.dek); return;
+        }
+        if (Date.now() < esperarHasta) { msg.textContent = "Espera " + Math.ceil((esperarHasta - Date.now()) / 1000) + " s para intentar de nuevo"; return; }
+        boton.disabled = true; boton.textContent = "Abriendo…";
+        try { const dek = await desenvolver(E.llave, clave, false); fallos = 0; resolver(dek); }
+        catch (err) {
+          boton.disabled = false; boton.textContent = "Entrar"; $("fa-bl-pin").value = ""; fallos++;
+          if (fallos >= 5) { esperarHasta = Date.now() + 30000; fallos = 0; msg.textContent = "Demasiados intentos: espera 30 s"; }
+          else msg.textContent = "Clave incorrecta";
+          $("fa-bl-pin").focus();
+        }
+      });
     });
   }
+  // Al volver a la app después de 1 minuto: se recarga y pide la clave (la llave sale de la memoria)
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") ocultoDesde = Date.now();
-    else if (E.pin && ocultoDesde && Date.now() - ocultoDesde > 60000) bloquear();
+    else if (E.dek && ocultoDesde && Date.now() - ocultoDesde > 60000) { E.dek = null; document.documentElement.classList.add("fa-bloqueada"); location.reload(); }
   });
 
   /* ── envío opcional a la planilla de Google (página puente ?a=pwa del panel 2.9+) ── */
@@ -268,16 +353,15 @@
       const estadoResp = E.respaldo ? "Último respaldo: hace " + (dias === 0 ? "menos de un día" : dias + (dias === 1 ? " día" : " días")) + "." : "Todavía no has hecho un respaldo.";
       const urgente = movs && (dias === null || dias >= DIAS_AVISO_RESPALDO);
       return '<h2>Respaldo</h2><div class="card" style="padding:14px 16px">' +
-        '<p class="ayuda" style="margin:0 0 10px">Tus datos viven solo en este teléfono. Si se borra el navegador o cambias de celular, sin respaldo se pierden. ' +
+        '<p class="ayuda" style="margin:0 0 10px">Tus datos viven solo en este teléfono. Si se borra el navegador o cambias de celular, sin respaldo se pierden. El archivo de respaldo va cifrado con una contraseña que eliges. ' +
         '<b' + (urgente ? ' style="color:var(--warn)"' : "") + ">" + esc(estadoResp) + "</b></p>" +
         '<div class="acc" style="margin:0"><button class="btn btn-p btn-bloque" onclick="FALocal.respaldar(this)"><i class="ti ti-download"></i>Guardar respaldo</button>' +
         '<button class="btn btn-bloque" onclick="FALocal.restaurar(this)"><i class="ti ti-upload"></i>Restaurar un respaldo</button></div></div>' +
 
-        '<h2>Bloqueo con PIN</h2><div class="card" style="padding:14px 16px">' +
-        '<p class="ayuda" style="margin:0 0 10px">' + (E.pin ? "Activo: la app pide tu PIN al abrirla y al volver después de un minuto." : "Pide un PIN al abrir la app, para que otra persona que tome tu celular no vea tus finanzas.") +
-        " No cifra los datos guardados en el teléfono.</p>" +
-        (E.pin ? '<div class="acc" style="margin:0"><button class="btn btn-bloque" onclick="FALocal.formPin()"><i class="ti ti-key"></i>Cambiar PIN</button><button class="btn btn-peligro btn-bloque" onclick="FALocal.quitarPin()"><i class="ti ti-lock-open"></i>Quitar PIN</button></div>'
-          : '<button class="btn btn-bloque" onclick="FALocal.formPin()"><i class="ti ti-lock"></i>Activar PIN</button>') + "</div>" +
+        '<h2>Clave y cifrado</h2><div class="card" style="padding:14px 16px">' +
+        '<p class="ayuda" style="margin:0 0 10px">Tus datos se guardan cifrados (AES-256) en este teléfono: sin tu clave no se pueden leer, aunque alguien copie el almacenamiento. ' +
+        "La app la pide al abrirla y al volver después de un minuto. Una clave con letras y números es mucho más difícil de adivinar que solo números.</p>" +
+        '<button class="btn btn-bloque" onclick="FALocal.formClave()"><i class="ti ti-key"></i>Cambiar clave</button></div>' +
 
         '<h2>Atajos</h2><div class="card" style="padding:14px 16px"><p class="ayuda" style="margin:0 0 10px">' +
         "Android: mantén presionado el ícono de Mis Finanzas para <i>Anotar gasto</i> o <i>Anotar ingreso</i>. " +
@@ -297,18 +381,31 @@
         '<button class="btn btn-bloque" onclick="FALocal.enviar(this)"><i class="ti ti-cloud-upload"></i>' + (pend ? "Enviar " + pend + (pend === 1 ? " movimiento nuevo" : " movimientos nuevos") : "Enviar a la planilla") + "</button></div>";
     },
 
-    async respaldar() {
+    respaldar() {
+      window.abrirHoja("Guardar respaldo",
+        '<p class="ayuda" style="margin:0 0 12px">El archivo va cifrado con esta contraseña: la necesitarás para restaurarlo (puede ser la misma clave de la app). Mínimo ' + MIN_RESPALDO + " caracteres. Sin ella, el respaldo no se puede abrir.</p>" +
+        '<div class="campo"><label for="fa-r1">Contraseña del respaldo</label><input class="inp" id="fa-r1" type="password" autocomplete="new-password"></div>' +
+        '<div class="campo"><label for="fa-r2">Repite la contraseña</label><input class="inp" id="fa-r2" type="password" autocomplete="new-password"></div>' +
+        '<div class="error" id="fa-r-err"></div>',
+        '<button class="btn btn-p btn-bloque" id="fa-r-ok" onclick="FALocal.generarRespaldo(this)"><i class="ti ti-download"></i>Cifrar y guardar</button>');
+      setTimeout(() => { const x = document.getElementById("fa-r1"); if (x) x.focus(); }, 80);
+    },
+    async generarRespaldo(b) {
+      const a = document.getElementById("fa-r1").value, a2 = document.getElementById("fa-r2").value, err = document.getElementById("fa-r-err");
+      if (a.length < MIN_RESPALDO) { err.textContent = "La contraseña debe tener al menos " + MIN_RESPALDO + " caracteres."; return; }
+      if (a !== a2) { err.textContent = "Las dos contraseñas no coinciden."; return; }
+      if (b) { b.disabled = true; b.textContent = "Cifrando…"; }
       await listo;
-      const texto = datosRespaldo(), nombre = nombreArchivo();
-      const archivo = new File([texto], nombre, { type: "application/json" });
+      const archivo = new File([await datosRespaldo(a)], nombreArchivo(), { type: "application/json" });
+      window.cerrarHoja();
       const tactil = window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
       if (tactil && navigator.canShare && navigator.canShare({ files: [archivo] })) {
         try { await navigator.share({ files: [archivo], title: "Respaldo de Mis Finanzas" }); await marcarRespaldo(); return; }
         catch (e) { if (e && e.name === "AbortError") return; }
       }
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(archivo); a.download = nombre; document.body.appendChild(a); a.click();
-      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+      const enlace = document.createElement("a");
+      enlace.href = URL.createObjectURL(archivo); enlace.download = archivo.name; document.body.appendChild(enlace); enlace.click();
+      setTimeout(() => { URL.revokeObjectURL(enlace.href); enlace.remove(); }, 1000);
       await marcarRespaldo();
     },
 
@@ -319,42 +416,56 @@
         const f = i.files && i.files[0]; if (!f) return;
         let r;
         try { r = JSON.parse(await f.text()); } catch (e) { avisar("Ese archivo no es un respaldo de Mis Finanzas."); return; }
-        const valido = r && r.app === "Mis Finanzas" && Array.isArray(r.hojas) && r.hojas.some(h => h && h.nombre === "Movimientos") &&
-          r.hojas.every(h => h && typeof h.nombre === "string" && Array.isArray(h.datos));
-        if (!valido) { avisar("Ese archivo no es un respaldo de Mis Finanzas."); return; }
-        const cuando = r.creado ? new Date(r.creado).toLocaleDateString("es-CL", { day: "numeric", month: "long", year: "numeric" }) : "fecha desconocida";
-        if (!confirm("Esto reemplaza todo lo que hay en este teléfono por el respaldo del " + cuando + " (" + (r.movimientos || 0) + " movimientos). ¿Seguir?")) return;
-        await escribir("libro", { hojas: r.hojas, props: r.props && typeof r.props === "object" ? r.props : {}, guardado: new Date().toISOString() });
-        await escribir("respaldo", r.creado || new Date().toISOString());
-        try { localStorage.removeItem("fa_datos"); } catch (e) {}
-        location.reload();
+        if (!r || r.app !== "Mis Finanzas") { avisar("Ese archivo no es un respaldo de Mis Finanzas."); return; }
+        if (r.formato === 2 && r.cifrado && r.datos) { FALocal._pendiente = r; FALocal.pedirContrasena(); return; }
+        if (!respaldoValido(r)) { avisar("Ese archivo no es un respaldo de Mis Finanzas."); return; }
+        if (!confirm("Este respaldo NO está cifrado (es de una versión anterior). Al restaurarlo, sus datos quedan cifrados en el teléfono; borra después el archivo. ¿Seguir?")) return;
+        await aplicarRespaldo(r, r.creado);
       };
       i.click();
     },
+    pedirContrasena() {
+      window.abrirHoja("Restaurar respaldo",
+        '<p class="ayuda" style="margin:0 0 12px">Escribe la contraseña con que se guardó este respaldo.</p>' +
+        '<div class="campo"><label for="fa-rr">Contraseña del respaldo</label><input class="inp" id="fa-rr" type="password" autocomplete="current-password"></div>' +
+        '<div class="error" id="fa-rr-err"></div>',
+        '<button class="btn btn-p btn-bloque" onclick="FALocal.abrirRespaldo(this)"><i class="ti ti-lock-open"></i>Abrir respaldo</button>');
+      setTimeout(() => { const x = document.getElementById("fa-rr"); if (x) x.focus(); }, 80);
+    },
+    async abrirRespaldo(b) {
+      const r = FALocal._pendiente, err = document.getElementById("fa-rr-err"); if (!r) return;
+      if (b) b.disabled = true;
+      let interior = null;
+      try {
+        const llave = await derivar(document.getElementById("fa-rr").value, deB64(r.cifrado.sal), Number(r.cifrado.iter) || ITER);
+        interior = JSON.parse(await descifrar(llave, { iv: r.cifrado.iv, ct: r.datos }));
+      } catch (e) { err.textContent = "Contraseña incorrecta (o el archivo está dañado)."; if (b) b.disabled = false; return; }
+      if (!respaldoValido(interior)) { err.textContent = "El respaldo no tiene el formato esperado."; if (b) b.disabled = false; return; }
+      FALocal._pendiente = null; window.cerrarHoja();
+      await aplicarRespaldo(interior, r.creado);
+    },
 
-    formPin() {
-      window.abrirHoja(E.pin ? "Cambiar PIN" : "Activar PIN",
-        '<p class="ayuda" style="margin:0 0 12px">De 4 a 8 números. Si lo olvidas, la única salida es borrar los datos del teléfono y restaurar un respaldo.</p>' +
-        '<div class="campo"><label for="fa-pin1">PIN nuevo</label><input class="inp num" id="fa-pin1" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off"></div>' +
-        '<div class="campo"><label for="fa-pin2">Repite el PIN</label><input class="inp num" id="fa-pin2" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off"></div>' +
-        '<div class="error" id="fa-pin-err"></div>',
-        '<button class="btn btn-p btn-bloque" onclick="FALocal.guardarPin(this)"><i class="ti ti-lock"></i>Guardar PIN</button>');
-      setTimeout(() => { const x = document.getElementById("fa-pin1"); if (x) x.focus(); }, 80);
+    formClave() {
+      window.abrirHoja("Cambiar clave",
+        '<p class="ayuda" style="margin:0 0 12px">Mínimo ' + MIN_CLAVE + " caracteres. Con letras y números es mucho más segura. Si la olvidas, solo se recuperan los datos restaurando un respaldo.</p>" +
+        '<div class="campo"><label for="fa-c0">Clave actual</label><input class="inp" id="fa-c0" type="password" autocomplete="current-password"></div>' +
+        '<div class="campo"><label for="fa-c1">Clave nueva</label><input class="inp" id="fa-c1" type="password" autocomplete="new-password"></div>' +
+        '<div class="campo"><label for="fa-c2">Repite la clave nueva</label><input class="inp" id="fa-c2" type="password" autocomplete="new-password"></div>' +
+        '<div class="error" id="fa-c-err"></div>',
+        '<button class="btn btn-p btn-bloque" onclick="FALocal.cambiarClave(this)"><i class="ti ti-key"></i>Cambiar clave</button>');
+      setTimeout(() => { const x = document.getElementById("fa-c0"); if (x) x.focus(); }, 80);
     },
-    async guardarPin() {
-      const a = document.getElementById("fa-pin1").value, b = document.getElementById("fa-pin2").value, err = document.getElementById("fa-pin-err");
-      if (!/^[0-9]{4,8}$/.test(a)) { err.textContent = "El PIN debe tener de 4 a 8 números."; return; }
-      if (a !== b) { err.textContent = "Los dos PIN no coinciden."; return; }
-      const sal = codigo();
-      E.pin = { sal: sal, hash: await hashPin(a, sal) };
-      await escribir("pin", E.pin);
-      try { localStorage.setItem("fa_pin_on", "1"); } catch (e) {}
-      window.cerrarHoja(); refrescarAjustes(); avisar("PIN activado.");
-    },
-    async quitarPin() {
-      if (!confirm("¿Quitar el PIN? La app abrirá sin pedirlo.")) return;
-      E.pin = null; await escribir("pin", null);
-      try { localStorage.removeItem("fa_pin_on"); } catch (e) {} refrescarAjustes(); avisar("PIN quitado.");
+    async cambiarClave(b) {
+      const v = id => document.getElementById(id).value, err = document.getElementById("fa-c-err");
+      if (v("fa-c1").length < MIN_CLAVE) { err.textContent = "La clave nueva debe tener al menos " + MIN_CLAVE + " caracteres."; return; }
+      if (v("fa-c1") !== v("fa-c2")) { err.textContent = "Las dos claves nuevas no coinciden."; return; }
+      if (b) b.disabled = true;
+      let dek;
+      try { dek = await desenvolver(E.llave, v("fa-c0"), true); }
+      catch (e) { err.textContent = "La clave actual no es correcta."; if (b) b.disabled = false; return; }
+      E.llave = await envolver(dek, v("fa-c1"));
+      await escribir("llave", E.llave);
+      window.cerrarHoja(); avisar("Clave cambiada.");
     },
 
     enlace(x) {
@@ -384,15 +495,15 @@
   const ESTILO = "#fa-bloqueo{position:fixed;inset:0;z-index:9999;background:var(--bg,#EEF2F7);display:flex;align-items:center;justify-content:center;padding:24px}" +
     ".fa-bl-caja{width:100%;max-width:320px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:10px}" +
     ".fa-bl-logo{width:56px;height:56px;border-radius:16px;background:linear-gradient(135deg,#163F6B,#1F5C99 60%,#4C8DDB);color:#fff;display:flex;align-items:center;justify-content:center;font:500 24px 'JetBrains Mono',ui-monospace,monospace}" +
-    ".fa-bl-caja h1{font-size:20px;margin:4px 0 0}.fa-bl-caja p{color:var(--t3,#566A80);margin:0 0 6px}" +
+    ".fa-bl-caja h1{font-size:20px;margin:4px 0 0}.fa-bl-caja p{color:var(--t3,#566A80);margin:0 0 6px}.fa-bl-caja .fa-bl-nota{font-size:13px;margin-top:6px}" +
     "#fa-bl-form{display:flex;flex-direction:column;gap:10px;width:100%}" +
-    "#fa-bl-pin{width:100%;min-height:56px;text-align:center;font-size:28px;letter-spacing:.4em;border:1px solid var(--b,#DCE4EE);border-radius:14px;background:var(--s,#fff);color:var(--t,#12304D)}" +
+    "#fa-bl-form input{width:100%;min-height:56px;text-align:center;font-size:24px;letter-spacing:.25em;border:1px solid var(--b,#DCE4EE);border-radius:14px;background:var(--s,#fff);color:var(--t,#12304D)}" +
+    "#fa-bl-form input::placeholder{font-size:15px;letter-spacing:normal}#fa-bl-form button:disabled{opacity:.6}" +
     "#fa-bl-form button{min-height:52px;border:0;border-radius:14px;background:var(--a,#1F5C99);color:var(--s,#fff);font-weight:700;font-size:16px}" +
     ".fa-bl-link{background:none;border:0;color:var(--a,#1F5C99);min-height:44px;font-weight:600}";
   document.addEventListener("DOMContentLoaded", () => {
     const st = document.createElement("style"); st.textContent = ESTILO; document.head.appendChild(st);
     listo.then(() => {
-      bloquear();
       setTimeout(() => {
         if (E.avisoRetorno) { avisar(E.avisoRetorno); return; }
         if (GUARDAR_DIRECTO) return;
