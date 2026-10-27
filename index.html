@@ -309,7 +309,7 @@ small.cmp.sube{color:var(--warn)}small.cmp.baja{color:var(--ok)}
 </div>
 <div class="toast" id="toast"></div>
 <script>
-var D = null, S = { vista: 'inicio', periodo: null, masTab: 0, reg: null, ocupado: false, filtro: '', q: '' }, VERSION_PANEL = '3.1', ACCION_PANEL = window.FA_ACCION || '', LOCAL = !!window.FA_LOCAL;
+var D = null, S = { vista: 'inicio', periodo: null, masTab: 0, reg: null, ocupado: false, filtro: '', q: '' }, VERSION_PANEL = '3.2', ACCION_PANEL = window.FA_ACCION || '', LOCAL = !!window.FA_LOCAL;
 function el(id){ return document.getElementById(id); }
 function esc(s){ return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function clp(n){ var v = Math.round(Number(n) || 0); return (v < 0 ? '−' : '') + '$' + Math.abs(v).toLocaleString('es-CL'); }

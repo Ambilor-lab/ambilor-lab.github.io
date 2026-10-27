@@ -7,6 +7,20 @@
 (function () {
   "use strict";
   window.FA_LOCAL = true;
+  // App nativa (Capacitor, Android/iOS) o web. En la nativa los plugins se piden por nombre a capacitor.js.
+  const NATIVO = !!(window.Capacitor && typeof window.Capacitor.isNativePlatform === "function" && window.Capacitor.isNativePlatform());
+  const PLATAFORMA = NATIVO ? window.Capacitor.getPlatform() : "web";
+  const plugin = n => (NATIVO && window.capacitorExports ? window.capacitorExports.registerPlugin(n) : null);
+  // Registro de fallas para la marcha blanca: solo el mensaje técnico (nunca datos ni montos), las últimas 20
+  const FALLAS = [];
+  try { JSON.parse(localStorage.getItem("fa_fallas") || "[]").slice(-20).forEach(x => FALLAS.push(x)); } catch (e) {}
+  function anotarFalla(msg) {
+    FALLAS.push({ t: new Date().toISOString(), m: String(msg || "error").slice(0, 300) });
+    while (FALLAS.length > 20) FALLAS.shift();
+    try { localStorage.setItem("fa_fallas", JSON.stringify(FALLAS)); } catch (e) {}
+  }
+  window.addEventListener("error", e => anotarFalla((e.message || "error") + (e.filename ? " @ " + String(e.filename).split("/").pop() + ":" + e.lineno : "")));
+  window.addEventListener("unhandledrejection", e => anotarFalla("promesa: " + ((e.reason && e.reason.message) || e.reason)));
   // La pantalla parte tapada hasta poner la clave (sin dejar ver nada ni un instante)
   document.documentElement.classList.add("fa-bloqueada");
   document.write("<style>.fa-bloqueada body>*:not(#fa-bloqueo){visibility:hidden}</style>");
@@ -153,6 +167,7 @@
     await traerUF();
     await procesarRetorno();
     await atajoDirecto();
+    if (NATIVO) atajosNativos();
   })();
 
   /* ── google.script.run local ── */
@@ -210,6 +225,42 @@
     setTimeout(() => avisar("Anotado: " + (d.nota || d.categoria || d.tipo) + " $" + Number(d.monto).toLocaleString("es-CL"), () => {
       window.google.script.run.withSuccessHandler(res => { if (res && res.ok && typeof window.pintar === "function") window.pintar(res.datos); avisar("Listo, se deshizo"); }).borrarMovimiento(r.id, null);
     }, "Deshacer"), 900);
+  }
+  // App nativa: atajos del ícono (Android) y enlaces misfinanzas://registrar?tipo=…&monto=…&categoria=…&guardar=1
+  // (los mismos parámetros que ?a=registrar en la web). El enlace con que se abrió la app se procesa una sola vez
+  // por sesión: si la app se recarga (por ejemplo, al pedir la clave de nuevo) no se vuelve a anotar.
+  function preDe(params) {
+    const pre = {};
+    ["tipo", "categoria", "medio", "nota"].forEach(k => { if (params.get(k)) pre[k] = params.get(k).slice(0, 120); });
+    const monto = String(params.get("monto") || "").replace(/\D/g, "").slice(0, 10);
+    if (monto) pre.monto = monto;
+    return pre;
+  }
+  async function abrirEnlace(url) {
+    let u; try { u = new URL(url); } catch (e) { return; }
+    if (u.protocol !== "misfinanzas:" || (u.hostname || u.pathname.replace(/^\/+/, "")) .indexOf("registrar") !== 0) return;
+    const pre = preDe(u.searchParams);
+    if (u.searchParams.get("guardar") === "1" && pre.monto) {
+      const d = Object.assign({ tipo: "Gasto", fecha: hoyIso(), cid: codigo() }, pre);
+      let r; try { r = E.motor.llamar("registrar", [d]); } catch (e) { r = null; }
+      if (r && r.ok) {
+        await guardarLibro();
+        if (typeof window.cargar === "function") window.cargar();
+        setTimeout(() => avisar("Anotado: " + (d.nota || d.categoria || d.tipo) + " $" + Number(d.monto).toLocaleString("es-CL")), 600);
+        return;
+      }
+    }
+    const t = setInterval(() => { if (window.D && typeof window.abrirRegistro === "function") { clearInterval(t); window.abrirRegistro(pre); } }, 200);
+    setTimeout(() => clearInterval(t), 8000);
+  }
+  async function atajosNativos() {
+    const App = plugin("App"); if (!App) return;
+    try {
+      const l = await App.getLaunchUrl();
+      let visto = ""; try { visto = sessionStorage.getItem("fa_enlace_inicio") || ""; } catch (e) {}
+      if (l && l.url && l.url !== visto) { try { sessionStorage.setItem("fa_enlace_inicio", l.url); } catch (e) {} await abrirEnlace(l.url); }
+    } catch (e) { anotarFalla("atajo: " + e.message); }
+    App.addListener("appUrlOpen", ev => { if (ev && ev.url) abrirEnlace(ev.url); });
   }
   function codigo() { return Array.from(crypto.getRandomValues(new Uint8Array(16)), b => "abcdefghijkmnpqrstuvwxyz23456789"[b % 32]).join(""); }
 
@@ -364,7 +415,7 @@
         '<button class="btn btn-bloque" onclick="FALocal.formClave()"><i class="ti ti-key"></i>Cambiar clave</button></div>' +
 
         '<h2>Atajos</h2><div class="card" style="padding:14px 16px"><p class="ayuda" style="margin:0 0 10px">' +
-        "Android: mantén presionado el ícono de Mis Finanzas para <i>Anotar gasto</i> o <i>Anotar ingreso</i>. " +
+        (PLATAFORMA === "ios" ? "" : "Android: mantén presionado el ícono de Mis Finanzas para <i>Anotar gasto</i> o <i>Anotar ingreso</i>. ") +
         "Para la app Atajos del iPhone o un widget de Android («Abrir URL»), copia el enlace de lo que anotas seguido: anota con un toque.</p>" +
         ((window.D && window.D.recientes && window.D.recientes.length) ? '<div class="lista">' + window.D.recientes.map((x, i) =>
           '<button class="fila toca" onclick="FALocal.copiarAtajo(' + i + ')"><span style="flex:1;min-width:0"><b>' + esc(x.nota || x.categoria) + '</b><small style="display:block;color:var(--t3)">' +
@@ -372,13 +423,18 @@
           : '<p class="ayuda" style="margin:0">Cuando anotes algo igual dos veces (por ejemplo, el café), aparecerá aquí para copiar su enlace.</p>') +
         '<button class="btn btn-bloque" style="margin-top:10px" onclick="FALocal.copiar(FALocal.enlace({}))"><i class="ti ti-link"></i>Copiar enlace «Anotar gasto»</button></div>' +
 
-        '<h2>Copia en tu planilla de Google (opcional)</h2><div class="card" style="padding:14px 16px">' +
+        (NATIVO ? "" : '<h2>Copia en tu planilla de Google (opcional)</h2><div class="card" style="padding:14px 16px">' +
         '<p class="ayuda" style="margin:0 0 10px">No hace falta: la app funciona sola. Si además usas Mis Finanzas en Google Sheets, pega el enlace de tu panel (termina en /exec) y envía los movimientos nuevos. ' +
         "Se envían solo los movimientos (no metas, tarjetas ni cambios posteriores); las categorías, tarjetas, metas y deudas deben existir también en la planilla.</p>" +
         '<div class="campo"><label for="fa-planilla">Enlace de tu panel</label><input class="inp" id="fa-planilla" type="url" inputmode="url" autocomplete="off" placeholder="https://script.google.com/macros/s/…/exec" value="' + esc(E.planilla) + '"></div>' +
         '<div class="error" id="fa-planilla-err"></div>' +
         (E.errores.length ? '<p class="ayuda" style="color:var(--bad);margin:6px 0">No se pudieron enviar: ' + E.errores.slice(0, 5).map(x => esc(x.error)).join(" · ") + (E.errores.length > 5 ? "…" : "") + "</p>" : "") +
-        '<button class="btn btn-bloque" onclick="FALocal.enviar(this)"><i class="ti ti-cloud-upload"></i>' + (pend ? "Enviar " + pend + (pend === 1 ? " movimiento nuevo" : " movimientos nuevos") : "Enviar a la planilla") + "</button></div>";
+        '<button class="btn btn-bloque" onclick="FALocal.enviar(this)"><i class="ti ti-cloud-upload"></i>' + (pend ? "Enviar " + pend + (pend === 1 ? " movimiento nuevo" : " movimientos nuevos") : "Enviar a la planilla") + "</button></div>") +
+
+        '<h2>¿Algo no funcionó?</h2><div class="card" style="padding:14px 16px">' +
+        '<p class="ayuda" style="margin:0 0 10px">Cuéntanos qué pasó y envíalo por WhatsApp o correo. El reporte lleva la versión, el tipo de teléfono y los errores técnicos recientes (' + FALLAS.length + "); nunca tus datos ni montos.</p>" +
+        '<div class="campo"><label for="fa-rep">Qué hacías y qué pasó</label><textarea class="inp" id="fa-rep" rows="3" maxlength="1000" style="min-height:88px;resize:vertical"></textarea></div>' +
+        '<button class="btn btn-bloque" onclick="FALocal.reportar(this)"><i class="ti ti-message-report"></i>Enviar reporte</button></div>';
     },
 
     respaldar() {
@@ -396,8 +452,19 @@
       if (a !== a2) { err.textContent = "Las dos contraseñas no coinciden."; return; }
       if (b) { b.disabled = true; b.textContent = "Cifrando…"; }
       await listo;
-      const archivo = new File([await datosRespaldo(a)], nombreArchivo(), { type: "application/json" });
+      const contenido = await datosRespaldo(a);
       window.cerrarHoja();
+      if (NATIVO) {
+        try {
+          const f = await plugin("Filesystem").writeFile({ path: nombreArchivo(), data: contenido, directory: "CACHE", encoding: "utf8" });
+          await plugin("Share").share({ title: "Respaldo de Mis Finanzas", files: [f.uri], dialogTitle: "Guardar respaldo" });
+          await marcarRespaldo();
+        } catch (e) {
+          if (!/cancel/i.test(String(e && e.message))) { anotarFalla("respaldo: " + (e && e.message)); avisar("No se pudo guardar el respaldo. Inténtalo de nuevo."); }
+        }
+        return;
+      }
+      const archivo = new File([contenido], nombreArchivo(), { type: "application/json" });
       const tactil = window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
       if (tactil && navigator.canShare && navigator.canShare({ files: [archivo] })) {
         try { await navigator.share({ files: [archivo], title: "Respaldo de Mis Finanzas" }); await marcarRespaldo(); return; }
@@ -469,11 +536,28 @@
     },
 
     enlace(x) {
-      const p = new URLSearchParams({ a: "registrar", tipo: x.tipo || "Gasto" });
+      const p = new URLSearchParams(NATIVO ? { tipo: x.tipo || "Gasto" } : { a: "registrar", tipo: x.tipo || "Gasto" });
       if (x.monto) p.set("monto", x.monto);
       ["categoria", "medio", "nota"].forEach(k => { if (x[k]) p.set(k, x[k]); });
       if (x.monto && x.categoria) p.set("guardar", "1");
-      return location.origin + location.pathname + "?" + p.toString();
+      return (NATIVO ? "misfinanzas://registrar" : location.origin + location.pathname) + "?" + p.toString();
+    },
+    // Marcha blanca: arma un reporte sin datos personales y lo comparte (WhatsApp, correo…)
+    async reportar() {
+      const desc = String((document.getElementById("fa-rep") || {}).value || "").trim();
+      const texto = ["Mis Finanzas · reporte de marcha blanca",
+        "Versión: " + (E.motor ? E.motor.VERSION : "?") + " (" + PLATAFORMA + ")",
+        "Equipo: " + navigator.userAgent,
+        "Pantalla: " + window.innerWidth + "×" + window.innerHeight,
+        "Fecha: " + new Date().toLocaleString("es-CL"), "",
+        "Qué pasó:", desc || "(sin descripción)", "",
+        "Errores técnicos recientes (" + FALLAS.length + "):"].concat(FALLAS.slice(-10).map(f => f.t + " · " + f.m)).join("\n");
+      try {
+        if (NATIVO) { await plugin("Share").share({ title: "Reporte de Mis Finanzas", text: texto, dialogTitle: "Enviar reporte" }); return; }
+        if (navigator.share) { await navigator.share({ title: "Reporte de Mis Finanzas", text: texto }); return; }
+      } catch (e) { if (e && (e.name === "AbortError" || /cancel/i.test(String(e.message)))) return; }
+      try { await navigator.clipboard.writeText(texto); avisar("Reporte copiado: pégalo en WhatsApp o en un correo."); }
+      catch (e) { window.prompt("Copia este reporte:", texto); }
     },
     copiarAtajo(i) { const x = window.D && window.D.recientes && window.D.recientes[i]; if (x) FALocal.copiar(FALocal.enlace(x)); },
     async copiar(texto) {
@@ -517,7 +601,7 @@
     });
   });
 
-  if ("serviceWorker" in navigator) {
+  if (!NATIVO && "serviceWorker" in navigator) {
     // Cuando llega una versión nueva de la app, se recarga sola una vez (sin esperar a la próxima apertura).
     // En la primera instalación no hay versión anterior, así que no recarga.
     if (navigator.serviceWorker.controller) {
