@@ -444,6 +444,8 @@
 
   /* ── vibración al guardar y lector de boletas (3.4) ── */
   if (NATIVO) window.FA_vibrar = () => { const H = plugin("Haptics"); if (H) H.impact({ style: "LIGHT" }).catch(() => {}); };
+  // Compartir el detalle de una cuenta (3.6): la hoja de compartir del teléfono (WhatsApp, Mensajes, etc.)
+  if (NATIVO) window.FA_compartirTexto = t => { plugin("Share").share({ title: "Cuenta compartida", text: t, dialogTitle: "Compartir cuenta" }).catch(() => {}); };
   // Boleta o factura electrónica: el código PDF417 del timbre del SII (Instructivo Emisión DTE, anexo 2) trae
   // <DD> con RUT del emisor (RE), tipo (TD), folio (F), fecha de emisión (FE, AAAA-MM-DD), monto total (MNT,
   // pesos enteros) y el primer ítem (IT1); el CAF de adentro trae la razón social del emisor (RS). Todo en el teléfono.
@@ -676,21 +678,32 @@
     document.documentElement.classList.remove("fa-bloqueada");
   }
   function debil(c) { return /^[0-9]+$/.test(c) && c.length < 10; }
-  // Huella (solo app nativa con lector): estado para Ajustes
+  // Huella (solo app nativa con lector): estado para Ajustes. En iPhone (3.5) es Face ID o Touch ID
   async function revisarHuella() {
     if (!NATIVO) return;
-    try { E.huellaDisp = await plugin("Huella").disponible(); } catch (e) { E.huellaDisp = null; }   // iPhone: aún no
+    try { E.huellaDisp = await plugin("Huella").disponible(); } catch (e) { E.huellaDisp = null; }
     try { E.huellaActiva = !!(await leer("huella")); } catch (e) { E.huellaActiva = false; }
   }
+  // Cómo se llama el desbloqueo en este teléfono: Android = huella; iPhone = Face ID o Touch ID
+  function bio(tipo) {
+    tipo = tipo || (E.huellaDisp && E.huellaDisp.tipo);
+    if (tipo === "faceid" || tipo === "touchid") {
+      const n = tipo === "faceid" ? "Face ID" : "Touch ID";
+      return { c: n, t: n, l: n, ico: tipo === "faceid" ? "ti-face-id" : "ti-fingerprint", off: tipo === "faceid" ? "ti-face-id-error" : "ti-fingerprint-off", ios: true };
+    }
+    return { c: "huella", t: "tu huella", l: "la huella", ico: "ti-fingerprint", off: "ti-fingerprint-off", ios: false };
+  }
   function bloqueHuella() {
-    const d = E.huellaDisp;
+    const d = E.huellaDisp, b = bio();
     if (!d || d.motivo === "sin-lector" || d.motivo === "otro") return "";
-    if (!d.disponible) return '<p class="ayuda" style="margin:12px 0 0">Para entrar con huella, primero registra una huella en los ajustes del teléfono.</p>';
+    if (!d.disponible) return '<p class="ayuda" style="margin:12px 0 0">' + (PLATAFORMA === "ios"
+      ? "Para entrar con Face ID, primero actívalo en Ajustes del iPhone → Face ID y código."
+      : "Para entrar con huella, primero registra una huella en los ajustes del teléfono.") + "</p>";
     return '<p class="ayuda" style="margin:12px 0 10px">' + (E.huellaActiva
-      ? "Entras con tu huella. Tu clave sigue sirviendo, y se pide si la huella falla."
-      : "Entra con tu huella en vez de escribir la clave. La llave queda en el chip de seguridad del teléfono y solo se abre con tu huella.") + "</p>" +
-      (E.huellaActiva ? '<button class="btn btn-bloque" onclick="FALocal.desactivarHuella(this)"><i class="ti ti-fingerprint-off"></i>Dejar de usar la huella</button>'
-                      : '<button class="btn btn-bloque" onclick="FALocal.formHuella()"><i class="ti ti-fingerprint"></i>Entrar con huella</button>');
+      ? "Entras con " + b.t + ". Tu clave sigue sirviendo, y se pide si " + b.l + " falla."
+      : "Entra con " + b.t + " en vez de escribir la clave. La llave queda en el chip de seguridad del teléfono y solo se abre con " + b.t + ".") + "</p>" +
+      (E.huellaActiva ? '<button class="btn btn-bloque" onclick="FALocal.desactivarHuella(this)"><i class="ti ' + b.off + '"></i>Dejar de usar ' + b.l + '</button>'
+                      : '<button class="btn btn-bloque" onclick="FALocal.formHuella()"><i class="ti ' + b.ico + '"></i>Entrar con ' + b.c + '</button>');
   }
   // modo "crear" (primera vez o datos sin cifrar de antes) o "abrir"; resuelve con la llave de datos
   function pedirClave(modo, hayDatos) {
@@ -715,24 +728,26 @@
       const Huella = NATIVO && !crear ? plugin("Huella") : null;
       let conHuella = null;
       async function probarHuella() {
-        if (!conHuella) return;
+        if (!conHuella || conHuella.invalida) return;
         try {
-          const r = await Huella.abrir({ datos: conHuella.datos, iv: conHuella.iv, titulo: "Mis Finanzas", subtitulo: "Pon tu huella para entrar" });
+          const r = await Huella.abrir({ datos: conHuella.datos, iv: conHuella.iv, titulo: "Mis Finanzas", subtitulo: bio(conHuella.tipo).ios ? "Entra a Mis Finanzas" : "Pon tu huella para entrar" });
           const dek = await crypto.subtle.importKey("raw", deB64(r.secreto), { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
           fallos = 0; resolver(dek);
         } catch (e) {
           const c = e && e.code;
           if (c === "invalidada") {
-            conHuella = null; $("fa-bl-huella").hidden = true; await kv("readwrite", o => o.delete("huella")).catch(() => {});
-            msg.textContent = "Las huellas del teléfono cambiaron. Entra con tu clave y vuelve a activar la huella en Ajustes.";
-          } else if (c === "bloqueado") msg.textContent = "Demasiados intentos con la huella. Usa tu clave.";
+            conHuella = { tipo: conHuella.tipo, invalida: true }; $("fa-bl-huella").hidden = true; await kv("readwrite", o => o.delete("huella")).catch(() => {});
+            msg.textContent = bio(conHuella.tipo).ios ? "Face ID cambió en el teléfono. Entra con tu clave y vuelve a activarlo en Ajustes."
+                                                      : "Las huellas del teléfono cambiaron. Entra con tu clave y vuelve a activar la huella en Ajustes.";
+          } else if (c === "bloqueado") msg.textContent = "Demasiados intentos con " + bio(conHuella.tipo).l + ". Usa tu clave.";
           else if (c !== "cancelado") anotarFalla("huella: " + (e && e.message));
           $("fa-bl-pin").focus();
         }
       }
       if (Huella) leer("huella").then(h => {
         if (!h || !h.datos) { $("fa-bl-pin").focus(); return; }
-        conHuella = h; $("fa-bl-huella").hidden = false; probarHuella();
+        conHuella = h; const b = bio(h.tipo), bt = $("fa-bl-huella");
+        bt.innerHTML = '<i class="ti ' + b.ico + '" aria-hidden="true"></i> Usar ' + b.c; bt.hidden = false; probarHuella();
       }, () => $("fa-bl-pin").focus());
       else setTimeout(() => $("fa-bl-pin").focus(), 50);
       if (!crear) $("fa-bl-huella").addEventListener("click", probarHuella);
@@ -1002,11 +1017,14 @@
       catch (e) { window.prompt("Copia este reporte:", texto); }
     },
     formHuella() {
-      window.abrirHoja("Entrar con huella",
-        '<p class="ayuda" style="margin:0 0 12px">Escribe tu clave una vez para activar la huella. Si cambian las huellas del teléfono, la app te pedirá la clave y la vuelves a activar.</p>' +
+      const b = bio();
+      window.abrirHoja("Entrar con " + b.c,
+        '<p class="ayuda" style="margin:0 0 12px">' + (b.ios
+          ? "Escribe tu clave una vez para activar " + b.l + ". Si cambias " + b.l + " del teléfono, la app te pedirá la clave y lo vuelves a activar."
+          : "Escribe tu clave una vez para activar la huella. Si cambian las huellas del teléfono, la app te pedirá la clave y la vuelves a activar.") + "</p>" +
         '<div class="campo"><label for="fa-h0">Tu clave</label><input class="inp" id="fa-h0" type="password" autocomplete="current-password"></div>' +
         '<div class="error" id="fa-h-err"></div>',
-        '<button class="btn btn-p btn-bloque" onclick="FALocal.activarHuella(this)"><i class="ti ti-fingerprint"></i>Activar huella</button>');
+        '<button class="btn btn-p btn-bloque" onclick="FALocal.activarHuella(this)"><i class="ti ' + b.ico + '"></i>Activar ' + b.c + '</button>');
       setTimeout(() => { const x = document.getElementById("fa-h0"); if (x) x.focus(); }, 80);
     },
     async activarHuella(b) {
@@ -1016,20 +1034,21 @@
       try { crudo = await crypto.subtle.exportKey("raw", await desenvolver(E.llave, document.getElementById("fa-h0").value, true)); }
       catch (e) { err.textContent = "La clave no es correcta."; if (b) b.disabled = false; return; }
       try {
-        const r = await plugin("Huella").guardar({ secreto: b64(crudo), titulo: "Activar huella", subtitulo: "Pon tu huella para confirmar" });
-        await escribir("huella", { v: 1, datos: r.datos, iv: r.iv });
+        const b = bio();
+        const r = await plugin("Huella").guardar({ secreto: b64(crudo), titulo: "Activar " + b.c, subtitulo: b.ios ? "Confirma para activar la entrada con " + b.c : "Pon tu huella para confirmar" });
+        await escribir("huella", { v: 1, datos: r.datos, iv: r.iv, tipo: (E.huellaDisp && E.huellaDisp.tipo) || "" });
       } catch (e) {
-        if (!(e && e.code === "cancelado")) { anotarFalla("huella: " + (e && e.message)); err.textContent = "No se pudo activar la huella. Inténtalo de nuevo."; }
+        if (!(e && e.code === "cancelado")) { anotarFalla("huella: " + (e && e.message)); err.textContent = "No se pudo activar " + bio().l + ". Inténtalo de nuevo."; }
         if (b) b.disabled = false; return;
       } finally { new Uint8Array(crudo).fill(0); }
       E.huellaActiva = true; window.cerrarHoja(); refrescarAjustes();
-      avisar("Listo: la próxima vez entras con tu huella");
+      avisar("Listo: la próxima vez entras con " + bio().t);
     },
     async desactivarHuella(b) {
       if (b) b.disabled = true;
       try { await plugin("Huella").borrar(); } catch (e) {}
       await kv("readwrite", o => o.delete("huella"));
-      E.huellaActiva = false; refrescarAjustes(); avisar("Ya no se usa la huella: entras con tu clave");
+      E.huellaActiva = false; refrescarAjustes(); avisar("Ya no se usa " + bio().l + ": entras con tu clave");
     },
     async nombresAtajo(si) {
       E.nombresAtajo = !!si; catalogoVisto = "";
@@ -1071,6 +1090,63 @@
       location.href = u + "?a=pwa#d=" + encodeURIComponent(JSON.stringify(lista)) + "&r=" + encodeURIComponent(location.origin + location.pathname);
     },
   };
+
+  /* ── presentación al abrir (3.5): logo, nombre y una línea de carga; dura 2,5 s y un toque la salta ──
+     Una vez por apertura; no sale en el atajo para anotar (debe ser inmediato) ni en el panel de la planilla. */
+  const INTRO_CSS = "#fa-intro{position:fixed;inset:0;z-index:10000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;" +
+      "background:radial-gradient(120% 80% at 50% 38%,#1F5C99 0%,#163F6B 42%,#0A1F38 100%);color:#fff;transition:opacity .45s cubic-bezier(.2,.8,.2,1);-webkit-user-select:none;user-select:none}" +
+    "#fa-intro{visibility:visible!important}#fa-intro.fuera{opacity:0;pointer-events:none}" +   // la pantalla de la clave oculta lo demás
+    "#fa-intro .in-logo{position:relative;width:92px;height:92px;border-radius:26px;background:linear-gradient(135deg,#163F6B,#1F5C99 55%,#4C8DDB);" +
+      "box-shadow:0 18px 40px -12px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,255,255,.25);display:flex;align-items:center;justify-content:center;" +
+      "font:600 40px 'JetBrains Mono',ui-monospace,Menlo,monospace;animation:fa-in-logo .75s cubic-bezier(.32,1.4,.48,1) both}" +
+    "#fa-intro .in-logo::after{content:'';position:absolute;inset:-2px;border-radius:28px;border:2px solid #8FC1FF;opacity:0;animation:fa-in-onda 1s .55s ease-out both}" +
+    "#fa-intro .in-brillo{position:absolute;inset:0;border-radius:26px;overflow:hidden}" +
+    "#fa-intro .in-brillo::before{content:'';position:absolute;top:-20%;bottom:-20%;width:40%;left:-60%;transform:skewX(-20deg);" +
+      "background:linear-gradient(90deg,transparent,rgba(255,255,255,.45),transparent);animation:fa-in-brillo .8s .7s ease-in-out both}" +
+    "#fa-intro .in-nombre{font:700 26px Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;letter-spacing:.01em;display:flex}" +
+    "#fa-intro .in-nombre span{display:inline-block;white-space:pre;opacity:0;animation:fa-in-letra .5s cubic-bezier(.2,.8,.2,1) both;animation-delay:calc(.6s + var(--i) * 45ms)}" +
+    "#fa-intro .in-firma{font:500 12px 'JetBrains Mono',ui-monospace,monospace;letter-spacing:.18em;color:#8FC1FF;opacity:0;animation:fa-in-sube .5s 1.15s ease-out both}" +
+    "#fa-intro .in-linea{width:120px;height:3px;border-radius:3px;background:rgba(255,255,255,.14);overflow:hidden}" +
+    "#fa-intro .in-linea i{display:block;height:100%;width:100%;border-radius:3px;background:linear-gradient(90deg,#4C8DDB,#8FC1FF);transform-origin:left;animation:fa-in-carga 1.5s .35s cubic-bezier(.6,0,.2,1) both}" +
+    "#fa-intro.fuera .in-logo{transform:scale(1.18);transition:transform .45s cubic-bezier(.2,.8,.2,1)}" +
+    "@keyframes fa-in-logo{0%{opacity:0;transform:scale(.55);filter:blur(8px)}100%{opacity:1;transform:scale(1);filter:blur(0)}}" +
+    "@keyframes fa-in-onda{0%{opacity:.8;transform:scale(1)}100%{opacity:0;transform:scale(1.7)}}" +
+    "@keyframes fa-in-brillo{0%{left:-60%}100%{left:130%}}" +
+    "@keyframes fa-in-letra{0%{opacity:0;transform:translateY(14px)}100%{opacity:1;transform:none}}" +
+    "@keyframes fa-in-sube{0%{opacity:0;transform:translateY(6px)}100%{opacity:1;transform:none}}" +
+    "@keyframes fa-in-carga{0%{transform:scaleX(0)}100%{transform:scaleX(1)}}" +
+    "@media (prefers-reduced-motion:reduce){#fa-intro *,#fa-intro *::before,#fa-intro *::after{animation:none!important;opacity:1!important}" +
+      "#fa-intro .in-logo::after,#fa-intro .in-brillo{display:none}#fa-intro.fuera .in-logo{transform:none}}";
+  function presentacion() {
+    try {
+      if (q.get("a") || GUARDAR_DIRECTO || navigator.webdriver || sessionStorage.getItem("fa_intro")) return;   // webdriver: las pruebas automáticas
+      sessionStorage.setItem("fa_intro", "1");
+    } catch (e) { return; }
+    const quieto = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const st = document.createElement("style"); st.textContent = INTRO_CSS; document.head.appendChild(st);
+    const v = document.createElement("div");
+    v.id = "fa-intro"; v.setAttribute("aria-hidden", "true");
+    v.innerHTML = '<div class="in-logo">F.<span class="in-brillo"></span></div>' +
+      '<div class="in-nombre">' + "Mis Finanzas".split("").map((c, i) => '<span style="--i:' + i + '">' + c + "</span>").join("") + "</div>" +
+      '<div class="in-linea"><i></i></div><div class="in-firma">AMBILOR.LAB</div>';
+    document.body.appendChild(v);
+    let fin = false;
+    const salir = () => {
+      if (fin) return; fin = true;
+      v.classList.add("fuera");
+      setTimeout(() => { v.remove(); st.remove(); }, 480);
+    };
+    v.addEventListener("pointerdown", salir);
+    if (!quieto) setTimeout(() => { try { if (window.FA_vibrar) window.FA_vibrar(); } catch (e) {} }, 650);
+    setTimeout(salir, quieto ? 1100 : 2050);   // + 0,45 s de salida: todo dura menos de 3 s
+    // en la app nativa, si se abrió desde el atajo para anotar, se quita apenas se sepa
+    if (NATIVO) enlaceAtajo().then(si => { if (si) { fin = true; v.remove(); st.remove(); } }, () => {});
+  }
+  async function enlaceAtajo() {
+    try { const u = sessionStorage.getItem("fa_enlace_nuevo") || ((await plugin("App").getLaunchUrl()) || {}).url || ""; return /anotar|registrar/.test(u); }
+    catch (e) { return false; }
+  }
+  if (document.body) presentacion(); else document.addEventListener("DOMContentLoaded", presentacion);
 
   /* ── al abrir: bloqueo, avisos y estilos propios ── */
   const ESTILO = "#fa-bloqueo{position:fixed;inset:0;z-index:9999;background:var(--bg,#EEF2F7);display:flex;align-items:center;justify-content:center;padding:24px}" +

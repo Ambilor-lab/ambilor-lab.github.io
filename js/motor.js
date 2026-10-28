@@ -20,10 +20,10 @@ window.FA_crearMotor = function (G) {
    - Un aporte a una meta es ahorro (no gasto); un retiro lo devuelve.
    ═══════════════════════════════════════════════════════════════════════ */
 
-const VERSION = "3.4";   // ver CAMBIOS.md
-const ESQUEMA = "1.4";
+const VERSION = "3.6";   // ver CAMBIOS.md
+const ESQUEMA = "1.5";
 
-const HOJA = { MOV: "Movimientos", CAT: "Categorías", METAS: "Metas", TARJ: "Tarjetas", DEUDAS: "Deudas", FIJOS: "Fijos", CONFIG: "Config" };
+const HOJA = { MOV: "Movimientos", CAT: "Categorías", METAS: "Metas", TARJ: "Tarjetas", DEUDAS: "Deudas", FIJOS: "Fijos", COMP: "Compartidas", CONFIG: "Config" };
 
 const CABECERAS = {
   "Movimientos": ["ID", "Fecha", "Tipo", "Monto", "Categoría", "Medio", "Cuotas", "Meta", "Deuda", "Nota", "Registrado", "Fijo"],
@@ -32,6 +32,8 @@ const CABECERAS = {
   "Tarjetas":    ["ID", "Tarjeta", "Cupo", "Día de cierre", "Día de pago", "Activa"],
   "Deudas":      ["ID", "Deuda", "Acreedor", "Cuota", "Cuotas", "Día de pago", "Inicio", "Activa", "Moneda"],
   "Fijos":       ["ID", "Fijo", "Tipo", "Monto", "Categoría", "Medio", "Día", "Activa"],
+  // cuentas compartidas (3.6): una fila por persona que me debe o a quien le debo; Grupo une las filas de una misma cuenta
+  "Compartidas": ["ID", "Fecha", "Cuenta", "Persona", "Sentido", "Monto", "Pagado", "Grupo", "Movimiento", "Detalle"],
   "Config":      ["Clave", "Valor", "Descripción"],
 };
 
@@ -72,6 +74,7 @@ const CONFIG_CAMPOS = [
   ["correoResumen", "texto", "", "Correo donde llega el resumen de cada mes, con PDF (vacío = no se envía)"],
   ["recordatorioHora", "numero", 0, "Hora del recordatorio diario por correo, solo si ese día no registraste nada (0 = no se envía)"],
   ["suscripcionesNo", "texto", "", "Cobros que se repiten y que dijiste que no son fijos (no se vuelven a sugerir)"],
+  ["propinaPct", "numero", 10, "Propina sugerida al dividir una cuenta compartida (%; 0 = sin propina)"],
 ];
 
 /* ── utilidades ─────────────────────────────────────────────────────── */
@@ -218,6 +221,7 @@ function config_() {
   cfg.diasAviso = Math.min(31, Math.max(1, Math.round(cfg.diasAviso) || 7));
   cfg.valorUF = Math.max(0, Number(cfg.valorUF) || 0);
   cfg.recordatorioHora = Math.round(cfg.recordatorioHora) >= 1 && Math.round(cfg.recordatorioHora) <= 23 ? Math.round(cfg.recordatorioHora) : 0;
+  cfg.propinaPct = Math.min(100, Math.max(0, Math.round(cfg.propinaPct) || 0));
   return cfg;
 }
 function categorias_() {
@@ -567,6 +571,7 @@ function panelDatos(indice) {
     medios: medios_(), movimientos: movimientosPeriodo_(i, cfg), cuotasPeriodo: cuotasPeriodo_(i, cfg), historial: historial_(i, cfg), ejemplo: hayEjemplo_(),
     recientes: recientes_(hoy), urlRegistrar: urlPanel_() ? urlPanel_() + "?a=registrar" : "", frecuentes: frecuentes_(hoy), fijos: fijos,
     explicaciones: explicaciones_(i, hoy, cfg), suscripciones: i === actual ? suscripciones_(hoy, cfg) : [], racha: racha_(hoy),
+    compartidas: estadoCompartidas_(),
   };
 }
 // Categorías más usadas en los últimos 90 días, por tipo (el registro rápido las pone primero)
@@ -833,6 +838,181 @@ function guardarDeuda(d) {
   if (!(pago >= 1 && pago <= 31)) return falla_("El día de pago va de 1 a 31.", "pago");
   return guardarElemento_(HOJA.DEUDAS, "D", d.id, { "Deuda": nombre, "Acreedor": texto_(d.acreedor).slice(0, 40), "Cuota": cuota, "Cuotas": cuotas, "Día de pago": pago, "Inicio": texto_(d.inicio) ? deIso_(d.inicio) : "", "Moneda": moneda, "Activa": d.activa === false ? "No" : "Si" });
 }
+/* ── cuentas compartidas (3.6) ──────────────────────────────────────────
+   «Generar cuenta» divide una compra entre varias personas (partes iguales, por consumo o montos a
+   mano) con propina. Como gasto propio cuenta SOLO MI PARTE; lo que otros me deben (si pagué yo) o lo
+   que le debo a quien pagó queda en la hoja Compartidas hasta que se paga. Ese pago devuelve plata que
+   el presupuesto nunca contó como mía: no es ingreso ni gasto nuevo, solo salda la fila. */
+const SENTIDO_ = { DEBE: "Me debe", DEBO: "Le debo" };
+// El cálculo. Lo usa el servidor y, tal cual (toString), el panel para la vista previa: por eso no llama
+// a otras funciones. d = { personas: [nombres; la 0 soy yo], modo: "iguales" | "items" | "manual", subtotal,
+// items: [{ nombre, precio, cantidad, de: [índices de quienes lo consumieron] }], montos: [uno por persona],
+// propinaPct, propinaMonto (si viene, manda sobre el %) }. Todo en pesos enteros y sumando exacto.
+function dividirCuenta_(d) {
+  d = d || {};
+  var mal = function (error, campo) { return { ok: false, error: error, campo: campo }; };
+  var pesos = function (v) { if (typeof v === "number") return isFinite(v) && v > 0 ? Math.round(v) : 0; var s = String(v == null ? "" : v).replace(/[^0-9]/g, ""); return s ? Number(s) : 0; };
+  var personas = (Array.isArray(d.personas) ? d.personas : []).map(function (p) { return String(p == null ? "" : p).trim().slice(0, 30); });
+  var n = personas.length, i, j;
+  if (n < 2) return mal("Agrega al menos a otra persona.", "personas");
+  if (n > 30) return mal("Hasta 30 personas por cuenta.", "personas");
+  personas[0] = personas[0] || "Yo";
+  var vistos = {};
+  for (i = 0; i < n; i++) {
+    if (!personas[i]) return mal("Ponle nombre a cada persona.", "personas");
+    if (vistos[personas[i].toLowerCase()]) return mal("Hay dos personas llamadas «" + personas[i] + "».", "personas");
+    vistos[personas[i].toLowerCase()] = true;
+  }
+  var modo = d.modo === "items" || d.modo === "manual" ? d.modo : "iguales";
+  var base = personas.map(function () { return 0; }), items = [];
+  if (modo === "items") {
+    var lista = (Array.isArray(d.items) ? d.items : []).filter(function (x) { return x && (String(x.nombre || "").trim() || pesos(x.precio)); });
+    if (!lista.length) return mal("Agrega al menos un ítem con su precio.", "items");
+    if (lista.length > 100) return mal("Hasta 100 ítems por cuenta.", "items");
+    for (i = 0; i < lista.length; i++) {
+      var x = lista[i], nombre = String(x.nombre || "").trim().slice(0, 40) || "Ítem " + (i + 1);
+      var precio = pesos(x.precio), cant = Math.min(99, Math.max(1, pesos(x.cantidad) || 1)), de = [];
+      if (!(precio > 0)) return mal("Falta el precio de «" + nombre + "».", "items");
+      (Array.isArray(x.de) ? x.de : []).forEach(function (k) { k = Number(k); if (k >= 0 && k < n && Math.floor(k) === k && de.indexOf(k) < 0) de.push(k); });
+      if (!de.length) return mal("Elige quién consumió «" + nombre + "».", "items");
+      for (j = 0; j < de.length; j++) base[de[j]] += precio * cant / de.length;
+      items.push({ nombre: nombre, precio: precio, cantidad: cant, total: precio * cant, de: de });
+    }
+  } else if (modo === "manual") {
+    var montos = Array.isArray(d.montos) ? d.montos : [];
+    base = personas.map(function (p, k) { return pesos(montos[k]); });
+  } else {
+    var s = pesos(d.subtotal);
+    base = personas.map(function () { return s / n; });
+  }
+  var subtotal = Math.round(base.reduce(function (a, b) { return a + b; }, 0));
+  if (!(subtotal > 0)) return modo === "manual" ? mal("Escribe cuánto pone cada persona.", "montos") : mal("Escribe el monto de la cuenta.", "subtotal");
+  if (subtotal > 999999999) return mal("El monto es demasiado grande.", "subtotal");
+  var aMano = d.propinaMonto !== undefined && d.propinaMonto !== null && String(d.propinaMonto) !== "";
+  var pct = aMano ? null : Math.min(100, Math.max(0, Number(String(d.propinaPct == null ? 0 : d.propinaPct).replace(",", ".")) || 0));
+  var propina = aMano ? pesos(d.propinaMonto) : Math.round(subtotal * pct / 100);
+  if (propina > subtotal) return mal("La propina no puede ser mayor que la cuenta.", "propina");
+  // reparte un monto en pesos enteros, en proporción a lo que consumió cada uno, sumando exacto (mayor resto)
+  var repartir = function (monto) {
+    var exactos = base.map(function (b) { return b * monto / subtotal; }), enteros = exactos.map(function (e) { return Math.floor(e); });
+    var falta = monto - enteros.reduce(function (a, b) { return a + b; }, 0);
+    var orden = exactos.map(function (e, k) { return { k: k, r: e - Math.floor(e) }; }).sort(function (a, b) { return b.r - a.r || a.k - b.k; });
+    for (var q = 0; q < falta; q++) enteros[orden[q % n].k]++;
+    return enteros;
+  };
+  var consumo = repartir(subtotal), propinas = repartir(propina);
+  return {
+    ok: true, modo: modo, subtotal: subtotal, propina: propina, pct: pct, total: subtotal + propina, items: items,
+    personas: personas.map(function (p, k) { return { nombre: p, consumo: consumo[k], propina: propinas[k], total: consumo[k] + propinas[k] }; })
+  };
+}
+function detalleCuenta_(r) {
+  return [clp_(r.total), r.personas.length + " personas", r.modo === "items" ? "por consumo" : (r.modo === "manual" ? "montos a mano" : "partes iguales"),
+    r.propina ? "propina " + (r.pct !== null ? r.pct + " % " : "") + clp_(r.propina) : "sin propina"].join(" · ");
+}
+// Guarda la cuenta: d = lo de dividirCuenta_ + { nombre, fecha, pagador (índice), categoria, medio, cuotas }
+function guardarCuenta(d) {
+  olvidarLecturas_();
+  asegurarEstructura_(); d = d || {};
+  const nombre = texto_(d.nombre).slice(0, 40);
+  if (!nombre) return falla_("Ponle nombre a la cuenta (ej: Asado del sábado).", "nombre");
+  const r = dividirCuenta_(d); if (!r.ok) return falla_(r.error, r.campo);
+  const pagador = Number(d.pagador);
+  if (!(Number.isInteger(pagador) && pagador >= 0 && pagador < r.personas.length)) return falla_("Elige quién pagó la cuenta.", "pagador");
+  const fecha = d.fecha ? fechaDe_(d.fecha) : ahora_();
+  if (!fecha) return falla_("Revisa la fecha.", "fecha");
+  if (diasEntre_(ahora_(), fecha) > 1) return falla_("La fecha no puede ser futura.", "fecha");
+  const mia = r.personas[0].total;
+  let mov = null;
+  if (mia > 0) {
+    const v = validarMovimiento_({ fecha: d.fecha, tipo: "Gasto", monto: mia, categoria: d.categoria, medio: d.medio, cuotas: d.cuotas, nota: nombre + " · cuenta compartida" });
+    if (!v.ok) return v;
+    mov = v.fila;
+  }
+  const filas = pagador === 0
+    ? r.personas.slice(1).filter(p => p.total > 0).map(p => ({ persona: p.nombre, sentido: SENTIDO_.DEBE, monto: p.total }))
+    : (mia > 0 ? [{ persona: r.personas[pagador].nombre, sentido: SENTIDO_.DEBO, monto: mia }] : []);
+  if (!filas.length && !mov) return falla_("No hay nada que anotar: tu parte es $0 y nadie te debe.", "personas");
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  try {
+    const grupo = idNuevo_("C"), movId = mov ? idNuevo_("M") : "", detalle = detalleCuenta_(r);
+    if (mov) agregarFilas_(tabla_(HOJA.MOV), [Object.assign({ "ID": movId, "Registrado": ahora_() }, mov)]);
+    if (filas.length) agregarFilas_(tabla_(HOJA.COMP), filas.map(f => ({ "ID": idNuevo_("P"), "Fecha": fecha, "Cuenta": nombre, "Persona": f.persona, "Sentido": f.sentido, "Monto": f.monto, "Pagado": 0, "Grupo": grupo, "Movimiento": movId, "Detalle": detalle })));
+    return { ok: true, grupo: grupo, datos: panelDatos() };
+  } finally { lock.releaseLock(); }
+}
+function compartidas_() {
+  const t = tabla_(HOJA.COMP); if (!t) return [];
+  return t.filas.map(f => {
+    const monto = Math.max(0, Math.round(numero_(f.Monto) || 0)), pagado = Math.min(monto, Math.max(0, Math.round(numero_(f.Pagado) || 0)));
+    return { id: texto_(f.ID), fecha: fechaDe_(f.Fecha), cuenta: texto_(f.Cuenta), persona: texto_(f.Persona), sentido: texto_(f.Sentido) === SENTIDO_.DEBO ? SENTIDO_.DEBO : SENTIDO_.DEBE, monto: monto, pagado: pagado, pendiente: monto - pagado, grupo: texto_(f.Grupo), movimiento: texto_(f.Movimiento), detalle: texto_(f.Detalle), _fila: f._fila };
+  }).filter(x => x.id && x.persona && x.monto > 0);
+}
+// Saldos por persona (lo que me debe menos lo que le debo), las últimas cuentas y los nombres usados
+function estadoCompartidas_() {
+  const lista = compartidas_(), por = {}, grupos = {}, recientes = [];
+  lista.forEach(x => {
+    const g = grupos[x.grupo] || (grupos[x.grupo] = { grupo: x.grupo, cuenta: x.cuenta, fecha: x.fecha ? iso_(x.fecha) : "", detalle: x.detalle, pendiente: 0, personas: [] });
+    g.pendiente += x.pendiente; g.personas.push({ persona: x.persona, sentido: x.sentido, monto: x.monto, pendiente: x.pendiente });
+    if (!(x.pendiente > 0)) return;
+    const k = x.persona.toLowerCase(), p = por[k] || (por[k] = { persona: x.persona, meDebe: 0, leDebo: 0, cuentas: [] });
+    if (x.sentido === SENTIDO_.DEBE) p.meDebe += x.pendiente; else p.leDebo += x.pendiente;
+    p.cuentas.push({ cuenta: x.cuenta, fecha: x.fecha ? iso_(x.fecha) : "", sentido: x.sentido, pendiente: x.pendiente });
+  });
+  const personas = Object.keys(por).map(k => Object.assign(por[k], { neto: por[k].meDebe - por[k].leDebo })).filter(p => p.neto !== 0 || p.cuentas.length)
+    .sort((a, b) => Math.abs(b.neto) - Math.abs(a.neto) || a.persona.localeCompare(b.persona));
+  lista.slice().sort((a, b) => (b.fecha || 0) - (a.fecha || 0)).forEach(x => { if (recientes.length < 12 && !recientes.some(n => n.toLowerCase() === x.persona.toLowerCase())) recientes.push(x.persona); });
+  return {
+    meDeben: personas.reduce((a, p) => a + Math.max(0, p.neto), 0), debo: personas.reduce((a, p) => a + Math.max(0, -p.neto), 0),
+    personas: personas, recientes: recientes,
+    cuentas: Object.keys(grupos).map(k => grupos[k]).sort((a, b) => b.fecha.localeCompare(a.fecha) || b.grupo.localeCompare(a.grupo)).slice(0, 20),
+  };
+}
+// Pago entre personas: d = { persona, monto } (sin monto = queda todo saldado). Lo cruzado (me debe y le debo)
+// se compensa; el abono paga primero lo más antiguo.
+function saldarCompartida(d) {
+  olvidarLecturas_();
+  asegurarEstructura_(); d = d || {};
+  const persona = texto_(d.persona).toLowerCase();
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  try {
+    const t = tabla_(HOJA.COMP), filas = compartidas_().filter(x => x.persona.toLowerCase() === persona && x.pendiente > 0);
+    if (!persona || !filas.length) return falla_("No hay nada pendiente con esa persona.");
+    const suma = s => filas.filter(x => x.sentido === s).reduce((a, x) => a + x.pendiente, 0);
+    const neto = suma(SENTIDO_.DEBE) - suma(SENTIDO_.DEBO), todo = !texto_(d.monto);
+    if (todo) filas.forEach(x => escribirFila_(t, x._fila, { "Pagado": x.monto }));
+    else {
+      const abono = Math.round(numero_(d.monto));
+      if (!(abono > 0)) return falla_("Escribe cuánto se pagó.", "monto");
+      if (abono > Math.abs(neto)) return falla_("Es más de lo pendiente (" + clp_(Math.abs(neto)) + ").", "monto");
+      const lado = neto >= 0 ? SENTIDO_.DEBE : SENTIDO_.DEBO, otro = filas.filter(x => x.sentido !== lado);
+      let cubrir = otro.reduce((a, x) => a + x.pendiente, 0) + abono;
+      otro.forEach(x => escribirFila_(t, x._fila, { "Pagado": x.monto }));
+      filas.filter(x => x.sentido === lado).sort((a, b) => (a.fecha || 0) - (b.fecha || 0) || a._fila - b._fila).forEach(x => {
+        const usa = Math.min(x.pendiente, cubrir);
+        if (usa > 0) { escribirFila_(t, x._fila, { "Pagado": x.pagado + usa }); cubrir -= usa; }
+      });
+    }
+    olvidarLecturas_();
+    return { ok: true, datos: panelDatos() };
+  } finally { lock.releaseLock(); }
+}
+// Borra una cuenta completa: sus filas en Compartidas y el gasto de mi parte
+function quitarCuenta(grupo) {
+  olvidarLecturas_();
+  asegurarEstructura_();
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  try {
+    const g = texto_(grupo), t = tabla_(HOJA.COMP), filas = g ? t.filas.filter(x => texto_(x.Grupo) === g) : [];
+    if (!filas.length) return falla_("Esa cuenta ya no existe.");
+    const movId = texto_(filas[0].Movimiento);
+    filas.map(x => x._fila).sort((a, b) => b - a).forEach(f => t.hoja.deleteRow(f));
+    olvidarLecturas_();
+    if (movId) { const tm = tabla_(HOJA.MOV), fm = tm.filas.find(x => texto_(x.ID) === movId); if (fm) tm.hoja.deleteRow(fm._fila); }
+    olvidarLecturas_();
+    return { ok: true, datos: panelDatos() };
+  } finally { lock.releaseLock(); }
+}
 /* ── datos de ejemplo (para mostrar la app y para que quien compra la explore) ──
    Todo lo de ejemplo lleva ID "EJ-…" y se borra junto. Solo se cargan en una planilla sin
    movimientos propios; los presupuestos anteriores se guardan y vuelven al borrar. */
@@ -1004,6 +1184,7 @@ function guardarConfig(cambios) {
       if (k === "alertaPct" && !(v >= 1 && v <= 100)) return falla_("El aviso va de 1 % a 100 %.", k);
       if (k === "diasAviso" && !(v >= 1 && v <= 31)) return falla_("Los días de aviso van de 1 a 31.", k);
       if (k === "valorUF" && (isNaN(v) || v < 0)) v = 0;
+      if (k === "propinaPct" && !(v >= 0 && v <= 100)) return falla_("La propina va de 0 % a 100 %.", k);
       if (k === "recordatorioHora") {
         if (isNaN(v) || v < 0 || v > 23) return falla_("Elige una hora de 1 a 23, o «No».", k);
         const correo = Object.prototype.hasOwnProperty.call(c, "correoResumen") ? texto_(c.correoResumen) : config_().correoResumen;
@@ -1381,6 +1562,42 @@ h2 button{font-size:13px;font-weight:600;color:var(--a);background:none;border:0
 .nav button.on{color:var(--a)}
 .nav .mas{flex:0 0 56px;height:56px;min-height:56px;border-radius:50%;background:linear-gradient(135deg,var(--marca-1),#1F5C99 55%,var(--glow));color:#fff;box-shadow:0 8px 22px -6px rgba(76,141,219,.75)}
 .nav .mas i{font-size:28px}
+/* barra estilo iOS (3.5): la pastilla de vidrio marca la sección, se desliza al cambiar y sigue al dedo al arrastrar */
+.nav{touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+.nav button{position:relative;z-index:1}
+.nav-p{position:absolute;left:0;top:0;width:var(--w,0);height:var(--h,0);transform:translate(var(--x,0),var(--y,0));border-radius:999px;background:color-mix(in srgb,var(--a) 14%,transparent);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--a) 22%,transparent);opacity:0;pointer-events:none}
+.nav.lista .nav-p{opacity:1;transition:transform .45s cubic-bezier(.32,1.4,.48,1),width .35s var(--ease),scale .2s var(--ease),background-color .2s,opacity .2s}
+.nav.arrastra .nav-p{transition:width .2s var(--ease),scale .2s var(--ease),background-color .2s;scale:1.12;background:color-mix(in srgb,var(--a) 22%,transparent);box-shadow:0 8px 20px -8px rgba(0,0,0,.4),inset 0 0 0 1px color-mix(in srgb,var(--a) 32%,transparent)}
+.nav.arrastra button[data-v]{color:var(--t3)}.nav.arrastra button.sobre{color:var(--a)}
+@media (prefers-reduced-motion:reduce){.nav.lista .nav-p{transition:opacity .2s}.nav.arrastra .nav-p{scale:1}}
+/* cuentas compartidas (3.6) */
+.cc-gen{margin:12px 0 4px}
+.cc-sal{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:12px 0 4px}.cc-sal .card{padding:12px 14px;display:flex;flex-direction:column;gap:2px}
+.cc-sal small{color:var(--t3);font-size:12.5px;font-weight:600}.cc-sal b{font-size:21px}
+.cc-pos{color:var(--ok)}.cc-neg{color:var(--bad)}
+.cc-av{font-weight:700;font-size:16px}
+.cc-pers,.cc-sug,.cc-de{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
+.cc .chip{min-height:38px;padding:0 12px;font-size:13.5px}
+.cc .chip.on,.cc .chip[aria-pressed=true]{background:var(--a);border-color:var(--a);color:#fff}
+.cc-p button{border:0;background:none;color:inherit;min-width:28px;min-height:28px;margin-right:-6px;display:inline-flex;align-items:center;justify-content:center}
+.cc-add{display:flex;gap:8px;margin:8px 0 4px}.cc-add .inp{flex:1;min-width:0}.cc-add .btn{flex:0 0 52px;padding:0}
+.cc-item{padding:10px;margin:8px 0}
+.cc-item-f{display:grid;grid-template-columns:minmax(0,1fr) 96px 54px 40px;gap:6px;align-items:center}
+.cc-item-f .inp{min-height:44px;padding:0 10px}
+.cc-x{border:0;background:none;color:var(--t3);min-height:44px;font-size:18px}
+.cc-tabla{padding:4px 12px;margin:14px 0 10px}
+.cc-fila{display:grid;grid-template-columns:minmax(0,1.25fr) repeat(3,minmax(0,1fr));gap:6px;padding:9px 0;border-bottom:1px solid var(--b);font-size:14px;align-items:baseline}
+.cc-fila>span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cc-fila>:not(:first-child){text-align:right}
+.cc-cab{font-size:11.5px;color:var(--t3);font-weight:700}
+.cc-tot{border-bottom:0;font-weight:700}
+.cc-fila small{color:var(--a);font-size:11px;font-weight:700}
+.cc-queda{display:flex;flex-direction:column;gap:8px;font-size:14.5px;color:var(--t2);margin-bottom:6px}
+.cc-queda i{color:var(--a);margin-right:4px}
+.cc-aviso{padding:14px;text-align:center;color:var(--t3);font-size:14px}
+.cc-ini{display:flex;align-items:center;gap:12px;width:100%;text-align:left;padding:14px 16px;margin-top:12px;font:inherit;color:inherit;cursor:pointer}
+.cc-ini .tx{flex:1;display:flex;flex-direction:column;gap:2px;min-width:0}.cc-ini small{color:var(--t3);font-size:12.5px}
+@media (max-width:360px){.cc-item-f{grid-template-columns:minmax(0,1fr) 84px 46px 34px}.cc-fila{font-size:13px}}
 /* hoja inferior (registro y formularios) */
 .velo{position:fixed;inset:0;z-index:40;background:rgba(5,10,20,.5);opacity:0;pointer-events:none;transition:opacity .25s}
 .velo.on{opacity:1;pointer-events:auto}
@@ -1534,6 +1751,7 @@ small.cmp.sube{color:var(--warn)}small.cmp.baja{color:var(--ok)}
   <section class="vista" id="v-mas"></section>
 </main>
 <nav class="nav" aria-label="Secciones">
+  <span class="nav-p" aria-hidden="true"></span>
   <button class="on" data-v="inicio" onclick="verVista('inicio')"><i class="ti ti-home"></i><span class="et">Inicio</span></button>
   <button data-v="movs" onclick="verVista('movs')"><i class="ti ti-list-details"></i><span class="et">Movimientos</span></button>
   <button class="mas" aria-label="Registrar" onclick="abrirRegistro()"><i class="ti ti-plus"></i></button>
@@ -1594,9 +1812,61 @@ function verVista(v){
   ['inicio','movs','metas','mas'].forEach(function(x){ el('v-' + x).classList.toggle('on', x === v); });
   [].forEach.call(document.querySelectorAll('.nav button[data-v]'), function(b){ b.classList.toggle('on', b.getAttribute('data-v') === v); });
   el('titulo').textContent = TITULOS[v];
+  navPastilla();
   if (D) pintarVista();
   window.scrollTo(0, 0);
 }
+// Barra estilo iOS (3.5): la pastilla se pone bajo el botón b (o el activo); con x, centrada en el dedo
+function navPastilla(b, x){
+  var nav = document.querySelector('.nav'), p = nav && nav.querySelector('.nav-p');
+  if (!p) return;
+  b = b || nav.querySelector('button.on[data-v]');
+  if (!b || !b.offsetWidth) return;
+  var w = b.offsetWidth, l = x == null ? b.offsetLeft : Math.max(0, Math.min(x - w / 2, nav.clientWidth - w));
+  p.style.setProperty('--x', l + 'px'); p.style.setProperty('--y', b.offsetTop + 'px');
+  p.style.setProperty('--w', w + 'px'); p.style.setProperty('--h', b.offsetHeight + 'px');
+  if (!nav.classList.contains('lista')) requestAnimationFrame(function(){ nav.classList.add('lista'); });
+}
+// Arrastrar el dedo por la barra: la pastilla lo sigue, vibra al pasar por cada sección y al soltar abre esa
+(function(){
+  var nav = document.querySelector('.nav');
+  if (!nav || !window.PointerEvent) return;
+  var ini = null, arr = false, sobre = null, sinClic = false;
+  function seccionEn(x){
+    var mejor = null, d = 1e9;
+    [].forEach.call(nav.querySelectorAll('button[data-v]'), function(b){ var r = b.getBoundingClientRect(), c = Math.abs(x - (r.left + r.width / 2)); if (c < d) { d = c; mejor = b; } });
+    return mejor;
+  }
+  nav.addEventListener('pointerdown', function(e){
+    if (e.button > 0 || e.target.closest('.mas')) return;
+    ini = { x: e.clientX, id: e.pointerId }; arr = false;
+  });
+  nav.addEventListener('pointermove', function(e){
+    if (!ini || e.pointerId !== ini.id) return;
+    if (!arr) {
+      if (Math.abs(e.clientX - ini.x) < 8) return;
+      arr = true; sobre = seccionEn(ini.x); if (sobre) sobre.classList.add('sobre');
+      try { nav.setPointerCapture(e.pointerId); } catch (er) {}
+      nav.classList.add('arrastra');
+    }
+    var b = seccionEn(e.clientX), r = nav.getBoundingClientRect();
+    if (b && b !== sobre) { if (sobre) sobre.classList.remove('sobre'); sobre = b; b.classList.add('sobre'); vibrar(); }
+    navPastilla(b, e.clientX - r.left - nav.clientLeft);
+  });
+  function fin(e){
+    if (!ini) return;
+    var era = arr, v = sobre && sobre.getAttribute('data-v');
+    ini = null; arr = false;
+    if (!era) return;
+    nav.classList.remove('arrastra'); if (sobre) sobre.classList.remove('sobre'); sobre = null;
+    sinClic = true; setTimeout(function(){ sinClic = false; }, 400);   // el toque que termina el arrastre no es un clic
+    if (e.type !== 'pointercancel' && v && v !== S.vista) verVista(v); else navPastilla();
+  }
+  nav.addEventListener('pointerup', fin); nav.addEventListener('pointercancel', fin);
+  nav.addEventListener('click', function(e){ if (sinClic) { sinClic = false; e.stopPropagation(); e.preventDefault(); } }, true);
+  if (window.ResizeObserver) new ResizeObserver(function(){ navPastilla(); }).observe(nav); else window.addEventListener('resize', function(){ navPastilla(); });
+  requestAnimationFrame(function(){ navPastilla(); });
+})();
 function pintarVista(){ ({ inicio: pintarInicio, movs: pintarMovs, metas: pintarMetas, mas: pintarMas })[S.vista](); }
 
 /* ── inicio ── */
@@ -1612,8 +1882,8 @@ function pintarInicio(){
   }
   if (D.proyeccion && S.periodo === D.actual && D.proyeccion.dias > 0) h += htmlProyeccion(D.proyeccion);
   if (r.alertas.length) h += '<div class="alertas">' + r.alertas.map(function(a){ return '<div class="alerta-f ' + a.estado + '"><i class="ti ' + (a.estado === 'excedido' ? 'ti-alert-octagon' : 'ti-alert-triangle') + '"></i><span><b>' + esc(a.nombre) + '</b> · ' + (a.estado === 'excedido' ? 'te pasaste por ' + clp(-a.restante) : (a.restante <= 0 ? 'usaste todo el presupuesto' : 'vas en el ' + a.pct + ' %, te quedan ' + clp(a.restante))) + '</span></div>'; }).join('') + '</div>';
-  h += htmlExplica() + htmlSuscripciones();
-  if (D.ejemplo) h += '<div class="ejemplo"><i class="ti ti-flask" aria-hidden="true"></i><span>Estás viendo <b>datos de ejemplo</b>.</span><button onclick="verMas(3)">Borrar</button></div>';
+  h += htmlExplica() + htmlSuscripciones() + htmlCompartidas();
+  if (D.ejemplo) h += '<div class="ejemplo"><i class="ti ti-flask" aria-hidden="true"></i><span>Estás viendo <b>datos de ejemplo</b>.</span><button onclick="verMas(4)">Borrar</button></div>';
   if (!D.movimientos.length && S.periodo === D.actual && !D.ejemplo) h += pasosInicio();
   if (D.proximos.length) {
     h += '<h2>Próximos pagos</h2><div class="card lista">' + D.proximos.map(function(p){ return '<button class="fila toca" onclick="' + (p.tipo === 'deuda' ? 'pagarDeuda(&#39;' + p.id + '&#39;)' : 'pagarTarjeta(this.getAttribute(&#39;data-v&#39;))" data-v="' + esc(p.nombre)) + '">' + ico(p.tipo === 'deuda' ? 'ti-building-bank' : 'ti-credit-card', p.dias <= 2 ? '#D93025' : '#E8710A') + '<span class="tx"><b>' + esc(p.nombre) + '</b><small>' + (p.dias === 0 ? 'Hoy' : (p.dias === 1 ? 'Mañana' : 'En ' + p.dias + ' días')) + ' · ' + fechaCorta(p.fecha) + '</small></span><span class="v num">' + (p.monto ? clp(p.monto) : 'Pagar') + '</span></button>'; }).join('') + '</div>';
@@ -1797,11 +2067,12 @@ function verMas(i){ S.masTab = i; verVista('mas'); }
 function seg(opciones, i, fn){ return '<div class="seg" role="tablist" style="--n:' + opciones.length + ';--i:' + i + '"><span class="pastilla"></span>' + opciones.map(function(o, k){ return '<button role="tab" aria-selected="' + (k === i) + '" class="' + (k === i ? 'on' : '') + '" onclick="' + fn + '(' + k + ')">' + (typeof o === 'string' ? o : '<span class="sl">' + o[0] + '</span><span class="sc">' + o[1] + '</span>') + '</button>'; }).join('') + '</div>'; }
 function cambiarMas(i){ S.masTab = i; pintarMas(); }
 function pintarMas(){
-  var h = seg(['Tarjetas','Fijos',['Presupuesto','Presup.'],'Ajustes'], S.masTab, 'cambiarMas');
+  var h = seg([['Tarjetas','Tarj.'],'Fijos',['Presupuesto','Presup.'],'Cuentas','Ajustes'], S.masTab, 'cambiarMas');
   if (S.masTab === 0) h += vistaTarjetas();
   if (S.masTab === 1) h += vistaFijos();
   if (S.masTab === 2) h += vistaPresupuesto();
-  if (S.masTab === 3) h += vistaAjustes();
+  if (S.masTab === 3) h += vistaCuentas();
+  if (S.masTab === 4) h += vistaAjustes();
   el('v-mas').innerHTML = h;
 }
 function vistaTarjetas(){
@@ -1877,6 +2148,7 @@ function vistaAjustes(){
     + campoTexto('aj-alerta', 'Avisarme cuando una categoría llegue al (%)', c.alertaPct, 'numero')
     + campoTexto('aj-dias', 'Mostrar pagos que vencen en los próximos (días)', c.diasAviso, 'numero')
     + campoTexto('aj-uf', 'Valor de la UF (déjalo en 0 y se actualiza solo cada día)', c.valorUF || 0, 'numero')
+    + campoTexto('aj-propina', 'Propina sugerida al generar una cuenta (%)', c.propinaPct, 'numero')
     + '<div class="error" id="aj-err"></div><div class="acc"><button class="btn btn-p btn-bloque" onclick="guardarAjustes(this)"><i class="ti ti-device-floppy"></i>Guardar ajustes</button></div></div>'
     + (LOCAL ? FALocal.ajustes() : '<h2>Correos de Mis Finanzas</h2><div class="card" style="padding:4px 16px 16px">'
     + campoTexto('aj-correo', 'Tu correo', c.correoResumen, 'email')
@@ -1909,7 +2181,7 @@ function enviarResumenAhora(b){
   api('enviarResumen', [S.periodo], function(r){ if (!r.ok) { el('aj-correo-err').textContent = r.error; return; } toast('Enviado a ' + r.correo + ': resumen de ' + r.periodo); }, b);
 }
 function guardarAjustes(b){
-  api('guardarConfig', [{ nombre: el('aj-nombre').value, inicioMes: el('aj-inicio').value, alertaPct: el('aj-alerta').value, diasAviso: el('aj-dias').value, valorUF: el('aj-uf').value }], function(r){ if (!r.ok) { el('aj-err').textContent = r.error; return; } toast('Ajustes guardados'); pintar(r.datos); }, b);
+  api('guardarConfig', [{ nombre: el('aj-nombre').value, inicioMes: el('aj-inicio').value, alertaPct: el('aj-alerta').value, diasAviso: el('aj-dias').value, valorUF: el('aj-uf').value, propinaPct: el('aj-propina').value }], function(r){ if (!r.ok) { el('aj-err').textContent = r.error; return; } toast('Ajustes guardados'); pintar(r.datos); }, b);
 }
 
 /* ── hoja inferior ── */
@@ -2184,6 +2456,179 @@ function vistaFijos(){
   return h + '<div class="card lista">' + D.fijos.map(function(x){ var c = cat(x.categoria); return '<button class="fila toca" onclick="formFijo(&#39;' + x.id + '&#39;)">' + ico(c.icono, c.color) + '<span class="tx"><b>' + esc(x.nombre) + '</b><small>Día ' + x.dia + ' · ' + esc(x.tipo === 'Ingreso' ? 'Ingreso' : x.medio) + (x.registrado ? ' · listo este mes' : '') + '</small></span><span class="v num">' + clp(x.monto) + '</span></button>'; }).join('') + '</div>';
 }
 
+/* ── cuentas compartidas (3.6): generar cuenta ──
+   El cálculo es el mismo del servidor (dividirCuenta_, insertado tal cual): lo que se ve es lo que se guarda. */
+var dividirCuenta = __DIVIDIR__;
+var PROPINAS = [0, 10, 15];
+function nombreYo(){ return (D.config && D.config.nombre) || 'Yo'; }
+function htmlCompartidas(){
+  var C = D.compartidas;
+  if (!C || !(C.meDeben || C.debo)) return '';
+  return '<button class="card cc-ini" onclick="verMas(3)">' + ico('ti-users', '#078C7E') + '<span class="tx"><b>Cuentas compartidas</b><small>'
+    + (C.meDeben ? 'Te deben <b class="num cc-pos">' + clp(C.meDeben) + '</b>' : '') + (C.meDeben && C.debo ? ' · ' : '') + (C.debo ? 'Debes <b class="num cc-neg">' + clp(C.debo) + '</b>' : '')
+    + '</small></span><i class="ti ti-chevron-right" aria-hidden="true"></i></button>';
+}
+function vistaCuentas(){
+  var C = D.compartidas || { meDeben: 0, debo: 0, personas: [], cuentas: [] }, h = '';
+  h += '<button class="btn btn-p btn-bloque cc-gen" onclick="nuevaCuenta()"><i class="ti ti-receipt"></i>Generar cuenta</button>';
+  h += '<p class="ayuda">Divide una compra entre varias personas: en partes iguales, por lo que consumió cada uno o con montos a mano, con propina. Tu parte se anota como gasto; el resto queda como lo que te deben o lo que debes.</p>';
+  if (C.meDeben || C.debo) h += '<div class="cc-sal"><div class="card"><small>Te deben</small><b class="num' + (C.meDeben ? ' cc-pos' : '') + '">' + clp(C.meDeben) + '</b></div><div class="card"><small>Debes</small><b class="num' + (C.debo ? ' cc-neg' : '') + '">' + clp(C.debo) + '</b></div></div>';
+  h += '<h2>Saldos por persona</h2>';
+  h += C.personas.length ? '<div class="card lista">' + C.personas.map(function(p){
+    var debe = p.neto >= 0, cuentas = [];
+    p.cuentas.forEach(function(x){ if (cuentas.indexOf(x.cuenta) < 0) cuentas.push(x.cuenta); });
+    return '<button class="fila toca" onclick="formSaldar(this.getAttribute(&#39;data-v&#39;))" data-v="' + esc(p.persona) + '"><span class="ico cc-av" style="background:' + (debe ? '#2E9E5B' : '#D0613A') + '" aria-hidden="true">' + esc(p.persona.charAt(0).toUpperCase()) + '</span><span class="tx"><b>' + esc(p.persona) + '</b><small>' + esc(cuentas.slice(0, 3).join(', ')) + '</small></span><span class="v num ' + (debe ? 'cc-pos' : 'cc-neg') + '">' + clp(Math.abs(p.neto)) + '<small>' + (p.neto === 0 ? 'se compensa' : (debe ? 'te debe' : 'le debes')) + '</small></span></button>';
+  }).join('') + '</div>' : '<div class="card vacio"><i class="ti ti-users"></i>Nadie te debe y no le debes a nadie. Cuando generes una cuenta, aquí verás quién te debe y cuánto.</div>';
+  if (C.cuentas.length) h += '<h2>Últimas cuentas</h2><div class="card lista">' + C.cuentas.map(function(g){
+    return '<button class="fila toca" onclick="verCuentaG(this.getAttribute(&#39;data-v&#39;))" data-v="' + esc(g.grupo) + '"><span class="tx"><b>' + esc(g.cuenta) + '</b><small>' + fechaCorta(g.fecha) + ' · ' + esc(g.detalle) + '</small></span><span class="v num">' + (g.pendiente > 0 ? clp(g.pendiente) + '<small>pendiente</small>' : '<small>Saldada</small>') + '</span></button>';
+  }).join('') + '</div>';
+  return h;
+}
+function nuevaCuenta(){
+  var p = Number((D.config || {}).propinaPct); if (isNaN(p)) p = 10;
+  var cats = D.categorias.filter(function(c){ return c.tipo === 'Gasto' && c.nombre !== 'Deudas'; });
+  var cf = cats.filter(function(c){ return c.nombre === 'Comida fuera'; })[0] || cats[0] || {};
+  var medio = leerLocal('medio'); if (D.medios.indexOf(medio) < 0) medio = D.medios.indexOf('Débito') >= 0 ? 'Débito' : D.medios[0];
+  S.cc = { nombre: '', fecha: D.hoy, personas: ['Yo'], modo: 0, subtotal: '', items: [{ nombre: '', precio: '', cantidad: 1, de: [0] }], montos: [],
+    prop: PROPINAS.indexOf(p) >= 0 ? PROPINAS.indexOf(p) : 3, propOtro: PROPINAS.indexOf(p) >= 0 ? '' : String(p), pagador: 0, categoria: cf.nombre || '', medio: medio || '' };
+  abrirHoja('Generar cuenta', '<div class="cc" id="cc-f"></div>', '<button class="btn" style="flex:0 0 auto" aria-label="Compartir el detalle" onclick="compartirCuenta()"><i class="ti ti-share"></i></button><button class="btn btn-p" onclick="guardarCuentaUI(this)"><i class="ti ti-check"></i>Guardar</button>');
+  pintarCuenta();
+  setTimeout(function(){ var x = el('cc-nombre'); if (x) x.focus(); }, 80);
+}
+function pintarCuenta(){
+  var c = S.cc, h = '', ent = function(v){ return String(v == null ? '' : v); };
+  h += '<div class="campo"><label for="cc-nombre">Nombre de la cuenta</label><input class="inp" id="cc-nombre" maxlength="40" placeholder="Ej: Asado del sábado" value="' + esc(c.nombre) + '" oninput="S.cc.nombre = this.value"></div>';
+  h += '<div class="campo"><label for="cc-fecha">Fecha</label><input class="inp" id="cc-fecha" type="date" value="' + esc(c.fecha) + '" max="' + esc(D.hoy) + '" oninput="S.cc.fecha = this.value"></div>';
+  h += '<div class="etq">Personas (' + c.personas.length + ')</div><div class="cc-pers">' + c.personas.map(function(p, i){
+    return '<span class="chip on cc-p">' + (i ? esc(p) : 'Yo') + (i ? '<button type="button" aria-label="Quitar a ' + esc(p) + '" onclick="ccQuitarPersona(' + i + ')"><i class="ti ti-x"></i></button>' : '') + '</span>';
+  }).join('') + '</div>';
+  h += '<div class="cc-add"><input class="inp" id="cc-nueva" maxlength="30" aria-label="Nombre de la persona" placeholder="Nombre (vacío: Persona ' + (c.personas.length + 1) + ')" onkeydown="if (event.key === &#39;Enter&#39;) { event.preventDefault(); ccAgregarPersona(); }"><button type="button" class="btn" onclick="ccAgregarPersona()" aria-label="Agregar persona"><i class="ti ti-user-plus"></i></button></div>';
+  var sug = ((D.compartidas || {}).recientes || []).filter(function(n){ return !ccTiene(n); }).slice(0, 8);
+  if (sug.length) h += '<div class="cc-sug">' + sug.map(function(n){ return '<button type="button" class="chip" onclick="ccAgregarPersona(this.getAttribute(&#39;data-v&#39;))" data-v="' + esc(n) + '"><i class="ti ti-plus"></i>' + esc(n) + '</button>'; }).join('') + '</div>';
+  h += '<div class="etq">Cómo se divide</div>' + seg([['Partes iguales','Iguales'], ['Por consumo','Consumo'], ['Montos a mano','A mano']], c.modo, 'ccModo');
+  if (c.modo === 0) h += '<div class="campo"><label for="cc-subtotal">Total de la cuenta, sin propina</label><input class="inp num" id="cc-subtotal" inputmode="numeric" placeholder="$0" value="' + miles(c.subtotal) + '" oninput="this.value = miles(this.value); S.cc.subtotal = this.value; ccCalc()"></div>';
+  if (c.modo === 1) h += '<div id="cc-items">' + c.items.map(function(it, k){
+    return '<div class="card cc-item"><div class="cc-item-f"><input class="inp" id="cc-it' + k + '" placeholder="Ítem (ej: Pizza)" maxlength="40" aria-label="Ítem" value="' + esc(it.nombre) + '" oninput="S.cc.items[' + k + '].nombre = this.value; ccCalc()">'
+      + '<input class="inp num" inputmode="numeric" placeholder="Precio" aria-label="Precio" value="' + miles(it.precio) + '" oninput="this.value = miles(this.value); S.cc.items[' + k + '].precio = this.value; ccCalc()">'
+      + '<input class="inp num" inputmode="numeric" aria-label="Cantidad" title="Cantidad" value="' + esc(ent(it.cantidad || 1)) + '" oninput="this.value = this.value.replace(/[^0-9]/g, &#39;&#39;).slice(0, 2); S.cc.items[' + k + '].cantidad = this.value; ccCalc()">'
+      + '<button type="button" class="cc-x" aria-label="Quitar ítem" onclick="ccQuitarItem(' + k + ')"><i class="ti ti-trash"></i></button></div>'
+      + '<div class="cc-de" role="group" aria-label="Quién lo consumió">' + c.personas.map(function(p, i){ var on = it.de.indexOf(i) >= 0; return '<button type="button" class="chip" aria-pressed="' + on + '" onclick="ccDe(' + k + ', ' + i + ', this)">' + (i ? esc(p) : 'Yo') + '</button>'; }).join('') + '</div></div>';
+  }).join('') + '</div><button type="button" class="btn btn-bloque" onclick="ccAgregarItem()"><i class="ti ti-plus"></i>Agregar ítem</button>';
+  if (c.modo === 2) h += '<div class="card lista">' + c.personas.map(function(p, i){
+    return '<div class="fila-ed"><span class="ed-tx"><b>' + (i ? esc(p) : 'Yo') + '</b></span><span class="pr-m"><input class="inp num" inputmode="numeric" placeholder="$0" aria-label="Cuánto pone ' + esc(i ? p : 'yo') + '" value="' + miles(c.montos[i]) + '" oninput="this.value = miles(this.value); S.cc.montos[' + i + '] = this.value; ccCalc()"><span aria-hidden="true">$</span></span></div>';
+  }).join('') + '</div>';
+  h += '<div class="etq">Propina</div>' + seg(['Sin', '10 %', '15 %', 'Otra'], c.prop, 'ccProp');
+  if (c.prop === 3) h += '<div class="campo"><label for="cc-propina">Propina (%)</label><input class="inp num" id="cc-propina" inputmode="decimal" maxlength="5" value="' + esc(c.propOtro) + '" oninput="S.cc.propOtro = this.value; ccCalc()"></div>';
+  h += '<div class="campo"><label for="cc-pagador">¿Quién pagó la cuenta?</label><select class="inp" id="cc-pagador" onchange="S.cc.pagador = Number(this.value); ccMedio(); ccCalc()">' + c.personas.map(function(p, i){ return '<option value="' + i + '"' + (i === c.pagador ? ' selected' : '') + '>' + (i ? esc(p) : 'Yo') + '</option>'; }).join('') + '</select></div>';
+  h += '<div class="campo"><label for="cc-categoria">Tu parte se anota como gasto en</label><select class="inp" id="cc-categoria" onchange="S.cc.categoria = this.value">' + D.categorias.filter(function(x){ return x.tipo === 'Gasto' && x.nombre !== 'Deudas'; }).map(function(x){ return '<option' + (x.nombre === c.categoria ? ' selected' : '') + '>' + esc(x.nombre) + '</option>'; }).join('') + '</select></div>';
+  h += '<div class="campo"><label for="cc-medio" id="cc-medio-l"></label><select class="inp" id="cc-medio" onchange="S.cc.medio = this.value">' + D.medios.map(function(m){ return '<option' + (m === c.medio ? ' selected' : '') + '>' + esc(m) + '</option>'; }).join('') + '</select></div>';
+  h += '<div id="cc-res" aria-live="polite"></div><div class="error" id="cc-err"></div>';
+  el('cc-f').innerHTML = h;
+  ccMedio(); ccCalc();
+}
+function ccMedio(){ var c = S.cc, l = el('cc-medio-l'); if (l) l.textContent = c.pagador === 0 ? 'Cómo pagaste' : 'Cómo le pagarás a ' + c.personas[c.pagador]; }
+function ccTiene(n){ n = String(n).toLowerCase(); return S.cc.personas.some(function(p){ return p.toLowerCase() === n; }) || (n === 'yo'); }
+function ccAgregarPersona(nombre){
+  var c = S.cc, x = el('cc-nueva'), n = String(nombre != null ? nombre : (x ? x.value : '')).trim().slice(0, 30);
+  if (!n) { var k = c.personas.length + 1; while (ccTiene('Persona ' + k)) k++; n = 'Persona ' + k; }
+  if (ccTiene(n)) { el('cc-err').textContent = n + ' ya está en la cuenta.'; return; }
+  if (c.personas.length >= 30) { el('cc-err').textContent = 'Hasta 30 personas por cuenta.'; return; }
+  var antes = c.personas.length; c.personas.push(n);
+  c.items.forEach(function(it){ if (it.de.length === antes) it.de.push(antes); });   // si lo compartían todos, también lo comparte quien llega
+  pintarCuenta();
+  if (nombre == null) { var y = el('cc-nueva'); if (y) y.focus(); }
+}
+function ccQuitarPersona(i){
+  var c = S.cc; c.personas.splice(i, 1); c.montos.splice(i, 1);
+  c.items.forEach(function(it){ it.de = it.de.filter(function(k){ return k !== i; }).map(function(k){ return k > i ? k - 1 : k; }); });
+  if (c.pagador === i) c.pagador = 0; else if (c.pagador > i) c.pagador--;
+  pintarCuenta();
+}
+function ccModo(k){ S.cc.modo = k; pintarCuenta(); }
+function ccProp(k){ S.cc.prop = k; pintarCuenta(); if (k === 3) { var x = el('cc-propina'); if (x) x.focus(); } }
+function ccAgregarItem(){ S.cc.items.push({ nombre: '', precio: '', cantidad: 1, de: S.cc.personas.map(function(p, i){ return i; }) }); pintarCuenta(); var x = el('cc-it' + (S.cc.items.length - 1)); if (x) x.focus(); }
+function ccQuitarItem(k){ S.cc.items.splice(k, 1); if (!S.cc.items.length) ccAgregarItem(); else pintarCuenta(); }
+function ccDe(k, i, b){ var de = S.cc.items[k].de, p = de.indexOf(i); if (p >= 0) de.splice(p, 1); else de.push(i); b.setAttribute('aria-pressed', String(p < 0)); ccCalc(); }
+function ccDatos(){ var c = S.cc; return { personas: c.personas, modo: ['iguales', 'items', 'manual'][c.modo], subtotal: c.subtotal, items: c.items, montos: c.montos, propinaPct: c.prop === 3 ? c.propOtro : PROPINAS[c.prop] }; }
+function ccCalc(){
+  var c = S.cc, r = dividirCuenta(ccDatos()), box = el('cc-res');
+  if (el('cc-err')) el('cc-err').textContent = '';
+  if (!box) return r;
+  if (!r.ok) { box.innerHTML = '<div class="card cc-aviso">' + esc(r.error) + '</div>'; return r; }
+  var h = '<div class="card cc-tabla"><div class="cc-fila cc-cab"><span>Persona</span><span>Consumo</span><span>Propina</span><span>Total</span></div>' + r.personas.map(function(p, i){
+    return '<div class="cc-fila"><span>' + (i ? esc(p.nombre) : 'Yo') + (i === c.pagador ? ' <small>pagó</small>' : '') + '</span><span class="num">' + clp(p.consumo) + '</span><span class="num">' + clp(p.propina) + '</span><b class="num">' + clp(p.total) + '</b></div>';
+  }).join('') + '<div class="cc-fila cc-tot"><span>Total</span><span class="num">' + clp(r.subtotal) + '</span><span class="num">' + clp(r.propina) + '</span><b class="num">' + clp(r.total) + '</b></div></div>';
+  var q = [], mia = r.personas[0].total;
+  if (mia > 0) q.push('<i class="ti ti-receipt"></i>Tu parte, <b class="num">' + clp(mia) + '</b>, se anota como gasto');
+  if (c.pagador === 0) r.personas.forEach(function(p, i){ if (i && p.total > 0) q.push('<i class="ti ti-arrow-down-left"></i><b>' + esc(p.nombre) + '</b> te debe <b class="num cc-pos">' + clp(p.total) + '</b>'); });
+  else if (mia > 0) q.push('<i class="ti ti-arrow-up-right"></i>Le debes a <b>' + esc(c.personas[c.pagador]) + '</b> <b class="num cc-neg">' + clp(mia) + '</b>');
+  box.innerHTML = h + '<div class="cc-queda">' + q.map(function(x){ return '<div>' + x + '</div>'; }).join('') + '</div>';
+  return r;
+}
+function guardarCuentaUI(b){
+  var r = ccCalc(), c = S.cc;
+  if (!r.ok) { el('cc-err').textContent = r.error; return; }
+  if (!c.nombre.trim()) { el('cc-err').textContent = 'Ponle nombre a la cuenta (ej: Asado del sábado).'; el('cc-nombre').focus(); return; }
+  var copia = JSON.parse(JSON.stringify(c)), d = ccDatos();
+  d.nombre = c.nombre; d.fecha = c.fecha; d.pagador = c.pagador; d.categoria = c.categoria; d.medio = c.medio;
+  api('guardarCuenta', [d], function(res){
+    if (!res.ok) { el('cc-err').textContent = res.error; var f = el('cc-' + res.campo); if (f) f.focus(); return; }
+    cerrarHoja(); vibrar(); pintar(res.datos);
+    toast('Cuenta guardada', function(){ compartirTexto(textoCuenta(r, copia)); }, 'Compartir');
+  }, b);
+}
+function textoCuenta(r, c){
+  var NLc = String.fromCharCode(10), L = [], nom = function(i){ return i ? r.personas[i].nombre : nombreYo(); };
+  L.push((c.nombre.trim() || 'Cuenta compartida') + ' · ' + fechaTexto(c.fecha || D.hoy));
+  if (r.items.length) { L.push(''); r.items.forEach(function(it){ L.push('• ' + it.nombre + (it.cantidad > 1 ? ' x' + it.cantidad : '') + ': ' + clp(it.total) + ' (' + it.de.map(nom).join(', ') + ')'); }); }
+  L.push(''); L.push('Subtotal ' + clp(r.subtotal) + (r.propina ? ' · Propina ' + (r.pct !== null ? r.pct + ' % ' : '') + clp(r.propina) : ' · Sin propina') + ' · Total ' + clp(r.total));
+  L.push(''); r.personas.forEach(function(p, i){ L.push(nom(i) + ': ' + clp(p.total)); });
+  L.push(''); L.push('Pagó ' + nom(c.pagador) + '.');
+  L.push('Hecho con Mis Finanzas · Ambilor.Lab');
+  return L.join(NLc);
+}
+function copiarTexto(t){
+  try { navigator.clipboard.writeText(t).then(function(){ toast('Detalle copiado: pégalo en WhatsApp'); }, function(){ window.prompt('Copia el detalle:', t); }); }
+  catch (e) { window.prompt('Copia el detalle:', t); }
+}
+function compartirTexto(t){
+  if (window.FA_compartirTexto) { window.FA_compartirTexto(t); return; }
+  if (navigator.share) { navigator.share({ text: t }).catch(function(e){ if (!e || e.name !== 'AbortError') copiarTexto(t); }); return; }
+  copiarTexto(t);
+}
+function compartirCuenta(){ var r = ccCalc(); if (!r.ok) { el('cc-err').textContent = r.error; return; } compartirTexto(textoCuenta(r, S.cc)); }
+function formSaldar(persona){
+  var p = ((D.compartidas || {}).personas || []).filter(function(x){ return x.persona === persona; })[0]; if (!p) return;
+  var debe = p.neto >= 0, m = Math.abs(p.neto);
+  var h = '<p class="ayuda" style="margin:0 0 10px">' + (m === 0 ? 'Lo que te debe y lo que le debes se compensan.' : (debe ? esc(persona) + ' te debe <b class="num">' + clp(m) + '</b>.' : 'Le debes a ' + esc(persona) + ' <b class="num">' + clp(m) + '</b>.'))
+    + ' Este pago no es ingreso ni gasto: tu parte ya se anotó como gasto y esto solo salda la cuenta.</p>';
+  h += '<div class="card lista">' + p.cuentas.map(function(x){ return '<div class="fila"><span class="tx"><b>' + esc(x.cuenta) + '</b><small>' + fechaCorta(x.fecha) + ' · ' + (x.sentido === 'Me debe' ? 'te debe' : 'le debes') + '</small></span><span class="v num">' + clp(x.pendiente) + '</span></div>'; }).join('') + '</div>';
+  if (m > 0) h += campoTexto('sd-monto', debe ? 'Si te pagó solo una parte, ¿cuánto?' : 'Si le pagaste solo una parte, ¿cuánto?', '', 'numero');
+  h += '<div class="error" id="sd-err"></div>';
+  abrirHoja(persona, h, (m > 0 ? '<button class="btn" id="sd-abono"><i class="ti ti-coin"></i>Anotar abono</button>' : '') + '<button class="btn btn-p" id="sd-todo"><i class="ti ti-check"></i>' + (m === 0 ? 'Dejar saldado' : (debe ? 'Me pagó todo' : 'Le pagué todo')) + '</button>');
+  var listo = function(texto){ return function(r){ if (!r.ok) { el('sd-err').textContent = r.error; return; } cerrarHoja(); vibrar(); toast(texto); pintar(r.datos); }; };
+  el('sd-todo').onclick = function(){ api('saldarCompartida', [{ persona: persona }], listo('Listo: saldado con ' + persona), this); };
+  if (m > 0) {
+    el('sd-monto').oninput = function(){ this.value = miles(this.value); };
+    el('sd-abono').onclick = function(){
+      var v = el('sd-monto').value.replace(/[^0-9]/g, '');
+      if (!v) { el('sd-err').textContent = 'Escribe cuánto se pagó.'; el('sd-monto').focus(); return; }
+      api('saldarCompartida', [{ persona: persona, monto: v }], listo('Abono anotado'), this);
+    };
+  }
+}
+function verCuentaG(g){
+  var x = ((D.compartidas || {}).cuentas || []).filter(function(c){ return c.grupo === g; })[0]; if (!x) return;
+  var h = '<p class="ayuda" style="margin:0 0 10px">' + fechaTexto(x.fecha) + ' · ' + esc(x.detalle) + '</p><div class="card lista">' + x.personas.map(function(p){
+    return '<div class="fila"><span class="tx"><b>' + esc(p.persona) + '</b><small>' + (p.sentido === 'Me debe' ? 'te debía ' : 'le debías ') + clp(p.monto) + '</small></span><span class="v num">' + (p.pendiente > 0 ? clp(p.pendiente) + '<small>pendiente</small>' : '<small>Pagado</small>') + '</span></div>';
+  }).join('') + '</div><p class="ayuda">Borrar la cuenta quita también el gasto de tu parte.</p><div class="error" id="cg-err"></div>';
+  abrirHoja(x.cuenta, h, '<button class="btn btn-peligro" id="cg-borrar"><i class="ti ti-trash"></i>Borrar cuenta</button>');
+  el('cg-borrar').onclick = function(){
+    if (!this.getAttribute('data-ok')) { this.setAttribute('data-ok', '1'); this.innerHTML = '<i class="ti ti-trash"></i>¿Borrar la cuenta y su gasto?'; return; }
+    api('quitarCuenta', [g], function(r){ if (!r.ok) { el('cg-err').textContent = r.error; return; } cerrarHoja(); toast('Cuenta borrada'); pintar(r.datos); }, this);
+  };
+}
+
 // Abre al instante con lo último que se vio en este teléfono y lo actualiza al llegar la respuesta
 (function(){
   var h = new Date(), hoy = h.getFullYear() + '-' + ('0' + (h.getMonth() + 1)).slice(-2) + '-' + ('0' + h.getDate()).slice(-2);
@@ -2192,7 +2637,7 @@ function vistaFijos(){
 })();
 </script>
 </body></html>
-`).replace("__VERSION__", VERSION);
+`).replace("__VERSION__", VERSION).replace("__DIVIDIR__", () => dividirCuenta_.toString());
 }
 // Página puente de la app sin conexión (?a=pwa). Mismas reglas que htmlPanel_: sin comillas invertidas, ${ ni barras invertidas.
 function htmlPuente_() {
@@ -2297,7 +2742,7 @@ google.script.url.getLocation(function(loc){
 `;
 }
 
-  var PERMITIDAS_APP_ = { panelDatos: panelDatos, registrar: registrar, editarMovimiento: editarMovimiento, borrarMovimiento: borrarMovimiento, guardarCategorias: guardarCategorias, guardarCategoria: guardarCategoria, quitarCategoria: quitarCategoria, guardarPresupuestos: guardarPresupuestos, guardarConfig: guardarConfig, quitar: quitar, cargarEjemplo: cargarEjemplo, borrarEjemplo: borrarEjemplo, guardarMeta: guardarMeta, guardarTarjeta: guardarTarjeta, guardarDeuda: guardarDeuda, guardarFijo: guardarFijo, descartarSuscripcion: descartarSuscripcion };
+  var PERMITIDAS_APP_ = { panelDatos: panelDatos, registrar: registrar, editarMovimiento: editarMovimiento, borrarMovimiento: borrarMovimiento, guardarCategorias: guardarCategorias, guardarCategoria: guardarCategoria, quitarCategoria: quitarCategoria, guardarPresupuestos: guardarPresupuestos, guardarConfig: guardarConfig, quitar: quitar, cargarEjemplo: cargarEjemplo, borrarEjemplo: borrarEjemplo, guardarMeta: guardarMeta, guardarTarjeta: guardarTarjeta, guardarDeuda: guardarDeuda, guardarFijo: guardarFijo, descartarSuscripcion: descartarSuscripcion, guardarCuenta: guardarCuenta, saldarCompartida: saldarCompartida, quitarCuenta: quitarCuenta };
   return {
     VERSION: VERSION, HOJA: HOJA, CABECERAS: CABECERAS, EJ: EJ_,
     llamar: function (nombre, args) {
