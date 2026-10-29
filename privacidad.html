@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="description" content="Qué hace Mis Finanzas con tus datos: quedan cifrados en tu teléfono, sin cuentas ni servidores. Una app de Ambilor.Lab.">
+<meta name="color-scheme" content="light dark">
+<title>Privacidad · Mis Finanzas</title>
+<link rel="icon" href="./icons/icon.svg" type="image/svg+xml">
+<style>
+:root{--bg:#EEF2F7;--s:#FFFFFF;--t:#12304D;--t2:#3E546D;--t3:#566A80;--b:#DCE4EE;--a:#1F5C99;--a-s:#EBF2FA;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;--mono:ui-monospace,Menlo,Consolas,monospace}
+@media (prefers-color-scheme:dark){:root{--bg:#06080C;--s:#0E131B;--t:#E8EDF5;--t2:#B4BFD2;--t3:#98A2B3;--b:#1B2330;--a:#8FC1FF;--a-s:#0B1624}}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--t);font:16px/1.6 var(--sans)}
+main{max-width:680px;margin:0 auto;padding:max(24px,env(safe-area-inset-top)) 16px max(40px,env(safe-area-inset-bottom))}
+.marca{font:600 14px var(--mono);color:var(--a);letter-spacing:-.3px;text-decoration:none}
+h1{font-size:clamp(26px,6vw,34px);line-height:1.2;margin:18px 0 6px}
+h1 span{color:var(--a)}
+.bajada{color:var(--t2);font-size:17px;margin:0 0 24px}
+.tarjeta{background:var(--s);border:1px solid var(--b);border-radius:14px;padding:20px 20px 8px;margin:0 0 14px}
+h2{font-size:18px;margin:0 0 8px}
+p,li{color:var(--t2)}
+p{margin:0 0 12px}
+ul{margin:0 0 12px;padding-left:20px}
+li{margin:0 0 6px}
+strong{color:var(--t)}
+.clave{background:var(--a-s);border:0}
+.clave h2{color:var(--a)}
+a{color:var(--a);font-weight:600}
+.volver{display:inline-block;margin:10px 0 0;padding:12px 18px;border-radius:12px;background:var(--a);color:var(--s);text-decoration:none}
+footer{margin-top:28px;font-size:13px;color:var(--t3)}
+footer .marca{font-size:13px}
+</style>
+</head>
+<body>
+<main>
+  <a class="marca" href="https://ambilor.github.io/ambilorlab/mis-finanzas/" rel="noopener">Ambilor.Lab</a>
+  <h1>Privacidad en Mis Finanzas<span>.</span></h1>
+  <p class="bajada">Lo que anotas es tuyo y se queda en tu teléfono. Aquí está, en simple, qué pasa con tus datos.</p>
+
+  <section class="tarjeta clave">
+    <h2>Lo más importante</h2>
+    <ul>
+      <li><strong>No hay cuentas ni servidores.</strong> No te registras con correo y lo que anotas no se envía a Ambilor.Lab ni a nadie más.</li>
+      <li><strong>Tu clave no sale del teléfono.</strong> Sirve para cifrar tus datos en el propio equipo. Por eso, si la olvidas, nadie puede recuperarla.</li>
+      <li><strong>Nunca te pedimos</strong> datos de tu banco, números de tarjeta ni contraseñas de otros servicios. Si alguien te los pide en nombre de Mis Finanzas, no somos nosotros.</li>
+    </ul>
+  </section>
+
+  <section class="tarjeta">
+    <h2>Dónde quedan tus datos</h2>
+    <p>En el almacenamiento de la app en tu teléfono, <strong>cifrados con AES-256</strong>. La llave que los abre está protegida por tu clave. Sin la clave, lo guardado no se puede leer.</p>
+    <p>Si borras la app o los datos del navegador, se borran también. Para no perderlos, haz un <strong>respaldo</strong> (Ajustes → Respaldo): es un archivo cifrado con una contraseña que eliges tú, y tú decides dónde guardarlo.</p>
+  </section>
+
+  <section class="tarjeta">
+    <h2>Qué se conecta a internet</h2>
+    <ul>
+      <li><strong>El valor de la UF y del dólar</strong>, que se consulta en mindicador.cl. No se envía ningún dato tuyo; si falla, lo escribes a mano en Ajustes.</li>
+      <li><strong>La app misma</strong>, la primera vez que la abres y cuando hay una versión nueva. Después funciona sin internet.</li>
+    </ul>
+    <p>Nada más. La app no usa publicidad ni herramientas que sigan lo que haces.</p>
+  </section>
+
+  <section class="tarjeta">
+    <h2>Lo que tú decides compartir</h2>
+    <ul>
+      <li><strong>Reportar un problema</strong> (Ajustes): arma un texto con la versión, el tipo de teléfono y los errores técnicos recientes, nunca tus montos ni movimientos. Lo envías tú, por WhatsApp, correo o donde elijas.</li>
+      <li><strong>Importar una cartola</strong>: el archivo se lee en el teléfono y no se sube a ningún lado.</li>
+      <li><strong>Avisos del banco y Apple Pay</strong> (opcionales, apagados por defecto): se leen en el teléfono y solo se guarda, cifrado, el monto, el comercio y la fecha.</li>
+    </ul>
+  </section>
+
+  <section class="tarjeta">
+    <h2>Quién está detrás</h2>
+    <p>Mis Finanzas es una app de <strong>Ambilor.Lab</strong>, desde Santiago de Chile. Puedes conocer más o escribirnos desde <a href="https://ambilor.github.io/ambilorlab/mis-finanzas/" rel="noopener">nuestro sitio</a>.</p>
+  </section>
+
+  <a class="volver" href="./">Volver a Mis Finanzas</a>
+
+  <footer>Actualizado el 29 de octubre de 2026 · <span class="marca">Ambilor.Lab</span></footer>
+</main>
+</body>
+</html>

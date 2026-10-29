@@ -20,7 +20,7 @@ window.FA_crearMotor = function (G) {
    - Un aporte a una meta es ahorro (no gasto); un retiro lo devuelve.
    ═══════════════════════════════════════════════════════════════════════ */
 
-const VERSION = "3.9";   // ver CAMBIOS.md
+const VERSION = "3.9.1";   // ver CAMBIOS.md
 const ESQUEMA = "1.7";
 
 const HOJA = { MOV: "Movimientos", CAT: "Categorías", METAS: "Metas", TARJ: "Tarjetas", DEUDAS: "Deudas", FIJOS: "Fijos", COMP: "Compartidas", ACT: "Activos", SALDOS: "Saldos", CONFIG: "Config" };

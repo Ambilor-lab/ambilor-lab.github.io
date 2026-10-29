@@ -798,6 +798,14 @@
     document.documentElement.classList.remove("fa-bloqueada");
   }
   function debil(c) { return /^[0-9]+$/.test(c) && c.length < 10; }
+  // Quién está detrás y qué pasa con la clave. Sin esto, una caja de clave sola en una dirección nueva
+  // parece phishing para los navegadores (Google la marcó así el 29-10-2026).
+  function confianza() {
+    return '<p class="fa-bl-conf"><i class="ti ti-lock" aria-hidden="true"></i> Tu clave no sale de este teléfono. ' +
+      "Mis Finanzas nunca pide datos de tu banco, tarjetas ni contraseñas de otros servicios.</p>" +
+      '<p class="fa-bl-firma">Mis Finanzas · ' + (NATIVO ? "Ambilor.Lab"
+        : '<a href="https://ambilor.github.io/ambilorlab/mis-finanzas/" target="_blank" rel="noopener">Ambilor.Lab</a> · <a href="./privacidad.html">Privacidad</a>') + "</p>";
+  }
   // Huella (solo app nativa con lector): estado para Ajustes. En iPhone (3.5) es Face ID o Touch ID
   async function revisarHuella() {
     if (!NATIVO) return;
@@ -829,7 +837,8 @@
         '<button type="button" id="fa-bl-letras" class="fa-bl-link">Usar letras y números</button>' +
         (crear ? '<p class="fa-bl-nota">Si olvidas la clave, tus datos no se pueden recuperar: solo restaurando un respaldo. Con letras y números es mucho más segura.</p>'
                : '<button type="button" id="fa-bl-huella" class="fa-bl-link" hidden><i class="ti ti-fingerprint" aria-hidden="true"></i> Usar huella</button>' +
-                 '<button type="button" id="fa-bl-olvide" class="fa-bl-link">Olvidé mi clave</button>') + "</div>";
+                 '<button type="button" id="fa-bl-olvide" class="fa-bl-link">Olvidé mi clave</button>') +
+        confianza() + "</div>";
       document.body.appendChild(v);
       document.documentElement.classList.add("fa-bloqueada");
       const $ = id => v.querySelector("#" + id), msg = $("fa-bl-msg"), boton = $("fa-bl-ok");
@@ -1365,8 +1374,13 @@
   if (document.body) presentacion(); else document.addEventListener("DOMContentLoaded", presentacion);
 
   /* ── al abrir: bloqueo, avisos y estilos propios ── */
-  const ESTILO = "#fa-bloqueo{position:fixed;inset:0;z-index:9999;background:var(--bg,#EEF2F7);display:flex;align-items:center;justify-content:center;padding:24px}" +
-    ".fa-bl-caja{width:100%;max-width:320px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:10px}" +
+  // se desplaza si no cabe (celular horizontal, poca altura); margin:auto lo centra cuando sí cabe
+  const ESTILO = "#fa-bloqueo{position:fixed;inset:0;z-index:9999;background:var(--bg,#EEF2F7);display:flex;align-items:flex-start;justify-content:center;overflow-y:auto;padding:max(24px,env(safe-area-inset-top)) 24px max(24px,env(safe-area-inset-bottom))}" +
+    ".fa-bl-caja{width:100%;max-width:320px;margin:auto;text-align:center;display:flex;flex-direction:column;align-items:center;gap:10px}" +
+    ".fa-bl-caja .fa-bl-conf{font-size:13px;line-height:1.45;margin:10px 0 0;padding:10px 12px;border-radius:12px;background:var(--a-suave,#EBF2FA);color:var(--t2,#3E546D)}" +
+    ".fa-bl-conf .ti{color:var(--a,#1F5C99)}" +
+    ".fa-bl-caja .fa-bl-firma{font-size:12px;margin:2px 0 0;font-family:'JetBrains Mono',ui-monospace,monospace}" +
+    ".fa-bl-firma a{color:var(--a,#1F5C99);display:inline-flex;align-items:center;min-height:44px;padding:0 4px;text-decoration:none;font-weight:600}" +
     ".fa-bl-logo{width:56px;height:56px;border-radius:16px;background:linear-gradient(135deg,#163F6B,#1F5C99 60%,#4C8DDB);color:#fff;display:flex;align-items:center;justify-content:center;font:500 24px 'JetBrains Mono',ui-monospace,monospace}" +
     ".fa-bl-caja h1{font-size:20px;margin:4px 0 0}.fa-bl-caja p{color:var(--t3,#566A80);margin:0 0 6px}.fa-bl-caja .fa-bl-nota{font-size:13px;margin-top:6px}" +
     "#fa-bl-form{display:flex;flex-direction:column;gap:10px;width:100%}" +
