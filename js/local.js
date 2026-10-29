@@ -113,6 +113,14 @@
     o.epk = await crypto.subtle.exportKey("jwk", efimera.publicKey);
     await sumarABandeja(o);
   }
+  // Lo anotado desde el widget (3.7, iPhone y Android) llega cifrado con el mismo formato: se suma a la bandeja
+  async function traerWidget() {
+    if (PLATAFORMA !== "ios" && PLATAFORMA !== "android") return;
+    const P = plugin("Widget"); if (!P) return;
+    let lista = [];
+    try { lista = JSON.parse((await P.tomarBandeja()).json || "[]"); } catch (e) { anotarFalla("widget: " + e.message); return; }
+    for (const o of lista) if (o && o.iv && o.ct && o.epk) await sumarABandeja(o);
+  }
   // Con la app abierta: suma la bandeja. Lo que no calza (una categoría que ya no existe) se abre en el registro, de a uno.
   async function vaciarBandeja() {
     const lista = (await leer("bandeja")) || [], privC = await leer("bandejaPriv");
@@ -137,7 +145,9 @@
   // Si la persona cierra el registro sin guardar, queda en la bandeja para la próxima vez.
   function siguienteRevision() {
     const x = E.revision && E.revision[0]; if (!x) { E.revision = null; return; }
-    const pre = { fecha: x.d.fecha }; ["tipo", "monto", "categoria", "medio", "nota"].forEach(k => { if (x.d[k]) pre[k] = String(x.d[k]); });
+    const pre = { fecha: x.d.fecha, revision: true }; ["tipo", "monto", "categoria", "medio", "nota"].forEach(k => { if (x.d[k]) pre[k] = String(x.d[k]); });
+    // sin categoría (Apple Pay, aviso del banco, atajo sin nombres): se sugiere una según el comercio o la nota (3.8)
+    if (!pre.categoria && pre.nota) { try { const r = E.motor.llamar("sugerirCategoria", [pre.nota, pre.tipo || "Gasto"]); if (r && r.categoria) pre.sugerida = r.categoria; } catch (e) {} }
     const t = setInterval(() => {
       if (!window.D || typeof window.abrirRegistro !== "function") return;
       clearInterval(t); window.abrirRegistro(pre);
@@ -146,6 +156,15 @@
     }, 200);
     setTimeout(() => clearInterval(t), 8000);
   }
+  // «No anotar» (3.8): lo que llegó desde un aviso del banco o Apple Pay y no era un gasto se saca de la bandeja
+  window.FA_descartarRevision = async () => {
+    const x = E.revision && E.revision[0]; if (!x) return;
+    E.revision.shift();
+    await kv("readwrite", s => { const r = s.get("bandeja"); r.onsuccess = () => s.put((r.result || []).filter(o => o.iv !== x.iv), "bandeja"); return r; });
+    if (typeof window.cerrarHoja === "function") window.cerrarHoja();
+    avisar("Listo, no se anotó");
+    setTimeout(siguienteRevision, 900);
+  };
   async function revisionHecha(d) {
     const x = E.revision && E.revision[0];
     if (!x || !d || String(d.tipo || "Gasto") !== String(x.d.tipo || "Gasto") || Number(d.monto) !== Number(x.d.monto)) return;
@@ -203,17 +222,25 @@
     E.motor = window.FA_crearMotor(s);
   }
 
-  // Valor de la UF del día (mindicador.cl). Sin internet, el motor usa el último conocido o el de Ajustes.
+  // Valor de la UF y del dólar del día (mindicador.cl). Sin internet, el motor usa el último conocido o el de Ajustes.
+  // El dólar se pide sin fecha (el fin de semana no hay valor del día: llega el último publicado).
   async function traerUF() {
-    try {
-      const hoy = hoyIso(), g = JSON.parse(E.props.getProperty("FA_UF") || "null");
-      if ((g && g.fecha === hoy) || !navigator.onLine) return;
-      const p = hoy.split("-"), ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 2500);
-      const r = await fetch("https://mindicador.cl/api/uf/" + p[2] + "-" + p[1] + "-" + p[0], { signal: ctl.signal });
-      clearTimeout(t);
-      const j = await r.json(), v = j && j.serie && j.serie[0] ? Number(j.serie[0].valor) : 0;
-      if (v > 0) { E.props.setProperty("FA_UF", JSON.stringify({ valor: v, fecha: hoy })); guardarLibro(); }
-    } catch (e) { /* sin conexión o sin permiso: se usa el último valor */ }
+    if (!navigator.onLine) return;
+    const hoy = hoyIso(), p = hoy.split("-");
+    const uno = async (url, prop) => {
+      try {
+        const g = JSON.parse(E.props.getProperty(prop) || "null");
+        if (g && g.fecha === hoy) return false;
+        const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 2500);
+        const r = await fetch(url, { signal: ctl.signal });
+        clearTimeout(t);
+        const j = await r.json(), v = j && j.serie && j.serie[0] ? Number(j.serie[0].valor) : 0;
+        if (v > 0) { E.props.setProperty(prop, JSON.stringify({ valor: v, fecha: hoy })); return true; }
+      } catch (e) { /* sin conexión o sin permiso: se usa el último valor */ }
+      return false;
+    };
+    const r = await Promise.all([uno("https://mindicador.cl/api/uf/" + p[2] + "-" + p[1] + "-" + p[0], "FA_UF"), uno("https://mindicador.cl/api/dolar", "FA_DOLAR")]);
+    if (r[0] || r[1]) guardarLibro();
   }
 
   const listo = (async () => {
@@ -234,6 +261,8 @@
     try { E.nombresAtajo = (await leer("atajoNombres")) !== false; } catch (e) {}
     try { E.avisos = Object.assign({}, AVISOS_BASE, (await leer("avisos")) || {}); } catch (e) {}
     try { E.widgetSaldo = (await leer("widgetSaldo")) === true; } catch (e) {}
+    try { E.widgetRapido = (await leer("widgetRapido")) === true; } catch (e) {}
+    try { const a = (await leer("autoRespaldo")) || {}; E.autoRespaldo = a.on !== false; E.autoUltimo = a.ultimo || ""; E.autoDir = a.dir || ""; } catch (e) {}
     if (E.llave && !viejo) await capturaAlAbrir();   // abierta desde un atajo: anota sin pedir la clave
     E.dek = await pedirClave(E.llave ? "abrir" : "crear", !!viejo);
     let guardado = viejo;
@@ -243,12 +272,15 @@
       await guardarLibro(); await kv("readwrite", o => o.delete("libro")); await kv("readwrite", o => o.delete("pin"));
     }
     desbloquearPantalla();
-    try { await prepararBandeja(); await vaciarBandeja(); } catch (e) { anotarFalla("bandeja: " + e.message); }
+    try { await prepararBandeja(); E.bandejaPub = await leer("bandejaPub"); await traerWidget(); await vaciarBandeja(); } catch (e) { anotarFalla("bandeja: " + e.message); }
     await revisarHuella();
+    if (PLATAFORMA === "ios") { try { E.widgetGrupo = !!(await plugin("Widget").estado()).grupo; } catch (e) { E.widgetGrupo = null; } }
     await traerUF();
     await procesarRetorno();
     await atajoDirecto();
     if (NATIVO) atajosNativos();
+    if (PLATAFORMA === "android") estadoAvisosBanco();
+    if (NATIVO) setTimeout(() => respaldoAuto(false).catch(e => anotarFalla("respaldo auto: " + (e && e.message))), 4000);
   })();
 
   /* ── google.script.run local ── */
@@ -346,6 +378,14 @@
   // (y se recarga) justo en ese momento, se retoma al abrir.
   function escucharEnlaces() {
     const App = plugin("App"); if (!App) return;
+    if (PLATAFORMA === "android") App.addListener("resume", () => { if (E.dek) estadoAvisosBanco(); });
+    if (PLATAFORMA === "ios" || PLATAFORMA === "android") App.addListener("resume", async () => {
+      if (!E.dek || E.recargando) return;
+      try {
+        await traerWidget();
+        if (((await leer("bandeja")) || []).length) { await vaciarBandeja(); if (typeof window.cargar === "function") window.cargar(window.S ? window.S.periodo : undefined); }
+      } catch (e) { anotarFalla("widget: " + e.message); }
+    });
     App.addListener("appUrlOpen", ev => {
       if (!ev || !ev.url) return;
       try { sessionStorage.setItem("fa_enlace_nuevo", ev.url); } catch (e) {}
@@ -422,7 +462,7 @@
     if (lista.length) await LN.schedule({ notifications: lista.map(n => Object.assign({ channelId: "avisos" }, n)) });
   }
 
-  /* ── widget de la pantalla de inicio (3.4, Android) ── */
+  /* ── widget de la pantalla de inicio (3.4 Android · 3.7 iPhone) ── */
   // El botón «Anotar gasto» funciona siempre. El monto solo se le pasa si la persona lo activa (Ajustes → Widget):
   // con presupuesto, lo que queda y el último día del mes (el widget divide por los días que faltan, cada día);
   // sin presupuesto, lo disponible del mes. Apagado, el teléfono no guarda ningún monto legible.
@@ -432,11 +472,51 @@
     return r.presupuestoTotal > 0 ? { mostrar: true, modo: "dia", monto: Math.max(0, r.presupuestoRestante), hasta: r.periodo.hasta }
       : { mostrar: true, modo: "mes", monto: r.disponible, hasta: r.periodo.hasta };
   }
+  // Registro rápido desde el widget (3.7, iPhone): lo que más repites, con nombre y monto. Solo si se activa en
+  // Ajustes (quedan legibles en el teléfono); lo que se anota con ellos va cifrado a la bandeja.
+  const SF = { "ti-shopping-cart": "cart.fill", "ti-home": "house.fill", "ti-bolt": "bolt.fill", "ti-car": "car.fill", "ti-bus": "bus.fill",
+    "ti-tools-kitchen-2": "fork.knife", "ti-coffee": "cup.and.saucer.fill", "ti-heart": "heart.fill", "ti-pill": "pills.fill", "ti-school": "graduationcap.fill",
+    "ti-device-tv": "tv.fill", "ti-device-mobile": "iphone", "ti-wifi": "wifi", "ti-shirt": "tshirt.fill", "ti-paw": "pawprint.fill", "ti-gift": "gift.fill",
+    "ti-plane": "airplane", "ti-barbell": "dumbbell.fill", "ti-beer": "wineglass.fill", "ti-building-bank": "building.columns.fill", "ti-briefcase": "briefcase.fill",
+    "ti-cash": "banknote.fill", "ti-tag": "tag.fill", "ti-dots": "ellipsis.circle.fill", "ti-plus": "plus.circle.fill", "ti-baby-carriage": "figure.and.child.holdinghands" };
+  function rapidosDe(D) {
+    if (!E.widgetRapido || !D || !Array.isArray(D.recientes)) return [];
+    return D.recientes.filter(x => x && (x.tipo === "Gasto" || x.tipo === "Ingreso") && Number(x.monto) > 0).slice(0, 8).map(x => {
+      const c = (D.categorias || []).find(k => k.nombre === x.categoria) || {};
+      return { n: String(x.nota || x.categoria).slice(0, 24), tipo: x.tipo, monto: Math.round(Number(x.monto)), categoria: x.categoria,
+        medio: x.medio || "", nota: x.nota || "", ico: SF[c.icono] || "tag.fill", color: c.color || "#1F5C99" };
+    });
+  }
+  // Resumen del mes para el widget (3.7, KPI): solo si la persona activó el saldo en Ajustes (montos legibles)
+  function kpiDe(D) {
+    if (!E.widgetSaldo || !D || !D.resumen || D.actual !== D.resumen.periodo.indice) return "";
+    const r = D.resumen, C = D.compartidas || {};
+    const top = (r.presupuesto || []).filter(x => x && x.gastado > 0).sort((a, b) => b.gastado - a.gastado)[0];
+    const n = v => Math.round(Number(v) || 0);
+    return JSON.stringify({ periodo: r.periodo.nombre || "", gastos: n(r.gastos), ingresos: n(r.ingresos), disponible: n(r.disponible), ahorro: n(r.ahorro),
+      presTotal: n(r.presupuestoTotal), presRest: n(r.presupuestoRestante), top: top ? top.nombre : "", topMonto: top ? n(top.gastado) : 0,
+      deben: n(C.meDeben), debes: n(C.debo) });
+  }
+  // categorías con las más usadas primero (para la fila de la ventanita de registro rápido)
+  function porUso(D, tipo) {
+    const fr = (D.frecuentes && D.frecuentes[tipo]) || [];
+    return D.categorias.filter(c => c.tipo === tipo && c.nombre !== "Deudas").map((c, i) => ({ n: c.nombre, k: fr.indexOf(c.nombre) < 0 ? 100 + i : fr.indexOf(c.nombre) }))
+      .sort((a, b) => a.k - b.k).map(x => x.n);
+  }
   let widgetVisto = "";
   function actualizarWidget(D) {
-    if (PLATAFORMA !== "android") return;
+    if (PLATAFORMA !== "android" && PLATAFORMA !== "ios") return;
     if (E.widgetSaldo && (!D || !D.resumen || D.actual !== D.resumen.periodo.indice)) return;   // mirando otro mes: no se toca
-    const w = widgetDe(D, E.widgetSaldo), t = JSON.stringify(w);
+    const w = widgetDe(D, E.widgetSaldo);
+    // Android: la ventanita de registro rápido usa los nombres de categorías y medios (si la persona lo permite)
+    // Android (ventanita) e iPhone (comandos de Siri): nombres de categorías y medios, y el medio de pago de siempre
+    if ((PLATAFORMA === "android" || PLATAFORMA === "ios") && E.nombresAtajo !== false && D && Array.isArray(D.categorias) && Array.isArray(D.medios)) {
+      let medio = ""; try { medio = localStorage.getItem("fa_medio") || ultimoMedio(); } catch (e) {}
+      if (D.medios.indexOf(medio) < 0) medio = D.medios.indexOf("Débito") >= 0 ? "Débito" : (D.medios[0] || "");
+      w.catalogo = JSON.stringify({ Gasto: porUso(D, "Gasto"), Ingreso: porUso(D, "Ingreso"), medios: D.medios, medio: medio });
+    }
+    if (PLATAFORMA === "ios" || PLATAFORMA === "android") { w.kpi = kpiDe(D); w.rapidos = JSON.stringify(rapidosDe(D)); if (E.bandejaPub && E.bandejaPub.x) w.pub = { x: E.bandejaPub.x, y: E.bandejaPub.y }; }
+    const t = JSON.stringify(w);
     if (t === widgetVisto) return;
     widgetVisto = t;
     const P = plugin("Widget"); if (P) P.actualizar(w).catch(e => anotarFalla("widget: " + (e && e.message)));
@@ -665,6 +745,32 @@
     await escribir("respaldo", creado || new Date().toISOString());
     location.reload();
   }
+  /* ── respaldo automático (3.8, app nativa) ── */
+  // Una vez al día, al abrir la app, guarda una copia cifrada con la llave de datos (que va envuelta con tu clave
+  // de la app: se abre con esa clave) en una carpeta que se ve fuera de la app: en iPhone, Archivos → En mi iPhone →
+  // Mis Finanzas (entra en el respaldo de iCloud del teléfono); en Android, Documentos/MisFinanzas. Quedan las 7 últimas.
+  const CARPETA_AUTO = "MisFinanzas", MAX_AUTO = 7, RE_AUTO = /^mis-finanzas-auto-\d{4}-\d{2}-\d{2}\.json$/;
+  async function respaldoAuto(forzar) {
+    if (!NATIVO || !E.dek || !E.llave || (!forzar && E.autoRespaldo === false)) return null;
+    if (!forzar && E.autoUltimo && Date.now() - new Date(E.autoUltimo).getTime() < 20 * 3600000) return null;
+    if (!forzar && !contarMovs(true)) return null;
+    const FS = plugin("Filesystem"); if (!FS) return null;
+    const interior = JSON.stringify({ version: E.motor.VERSION, movimientos: contarMovs(false), hojas: aGuardar(E.ss), props: E.props.getProperties() });
+    const contenido = JSON.stringify({ app: "Mis Finanzas", formato: 3, automatico: true, creado: new Date().toISOString(), llave: E.llave, datos: await cifrar(E.dek, interior) });
+    const nombre = "mis-finanzas-auto-" + hoyIso() + ".json", ruta = CARPETA_AUTO + "/" + nombre;
+    let dir = "DOCUMENTS";
+    try { await FS.writeFile({ path: ruta, data: contenido, directory: dir, encoding: "utf8", recursive: true }); }
+    catch (e) { dir = "DATA"; await FS.writeFile({ path: ruta, data: contenido, directory: dir, encoding: "utf8", recursive: true }); }
+    try {   // se borran los más antiguos
+      const l = await FS.readdir({ path: CARPETA_AUTO, directory: dir });
+      const ns = (l.files || []).map(f => (typeof f === "string" ? f : f.name)).filter(n => RE_AUTO.test(n)).sort();
+      for (const n of ns.slice(0, Math.max(0, ns.length - MAX_AUTO))) await FS.deleteFile({ path: CARPETA_AUTO + "/" + n, directory: dir });
+    } catch (e) { anotarFalla("respaldo auto: " + e.message); }
+    E.autoUltimo = new Date().toISOString(); E.autoDir = dir;
+    await escribir("autoRespaldo", { on: E.autoRespaldo !== false, ultimo: E.autoUltimo, dir: dir });
+    refrescarAjustes();
+    return { nombre: nombre, dir: dir };
+  }
   async function marcarRespaldo() {
     E.respaldo = new Date().toISOString(); await escribir("respaldo", E.respaldo);
     programarAvisos(window.D);
@@ -744,12 +850,14 @@
           $("fa-bl-pin").focus();
         }
       }
+      // el teclado (y Face ID) recién al terminar la presentación: antes taparía la animación
+      const enfocar = () => finIntro.then(() => { if (document.body.contains(v)) $("fa-bl-pin").focus(); });
       if (Huella) leer("huella").then(h => {
-        if (!h || !h.datos) { $("fa-bl-pin").focus(); return; }
+        if (!h || !h.datos) { enfocar(); return; }
         conHuella = h; const b = bio(h.tipo), bt = $("fa-bl-huella");
-        bt.innerHTML = '<i class="ti ' + b.ico + '" aria-hidden="true"></i> Usar ' + b.c; bt.hidden = false; probarHuella();
-      }, () => $("fa-bl-pin").focus());
-      else setTimeout(() => $("fa-bl-pin").focus(), 50);
+        bt.innerHTML = '<i class="ti ' + b.ico + '" aria-hidden="true"></i> Usar ' + b.c; bt.hidden = false; finIntro.then(probarHuella);
+      }, enfocar);
+      else enfocar();
       if (!crear) $("fa-bl-huella").addEventListener("click", probarHuella);
       $("fa-bl-letras").addEventListener("click", () => {
         const letras = $("fa-bl-pin").getAttribute("inputmode") === "numeric";
@@ -824,6 +932,10 @@
   }
 
   /* ── lo que el panel muestra en Más → Ajustes ── */
+  async function estadoAvisosBanco() {
+    try { E.avisosBanco = await plugin("Widget").estadoAvisosBanco(); } catch (e) { E.avisosBanco = null; }
+    refrescarAjustes();
+  }
   function refrescarAjustes() {
     if (window.S && window.S.vista === "mas" && typeof window.pintarVista === "function") window.pintarVista();
   }
@@ -840,13 +952,71 @@
       (o.on ? '<div class="campo" style="margin-top:6px"><label for="fa-av-h">Recordatorio diario (no llega si ese día ya anotaste)</label><select class="inp" id="fa-av-h" onchange="FALocal.avisos(\'hora\', Number(this.value))">' + horas + "</select></div>" +
         chk("pagos", "Pagos que vencen (tarjetas, deudas y fijos), el día antes") + chk("respaldo", "Recordarme el respaldo cada 7 días") + chk("detalle", "Mostrar nombres y montos en el aviso") +
         '<p class="ayuda" style="margin:4px 0 0">Si no muestras nombres ni montos, el aviso solo dice «Mañana vence un pago»: quien vea tu pantalla bloqueada no sabe qué ni cuánto.</p>' : "") + "</div>" +
-      (PLATAFORMA !== "android" ? "" : '<h2>Widget</h2><div class="card" style="padding:14px 16px">' +
-        '<p class="ayuda" style="margin:0 0 6px">Mantén presionada la pantalla de inicio → <i>Widgets</i> → <i>Mis Finanzas</i>. Su botón <b>Anotar gasto</b> anota sin escribir tu clave.</p>' +
-        '<label style="display:flex;gap:12px;align-items:center;min-height:44px;cursor:pointer;font-weight:600"><input type="checkbox" style="width:22px;height:22px;flex:none;accent-color:var(--a)" onchange="FALocal.widgetSaldo(this.checked)"' + (E.widgetSaldo ? " checked" : "") + "><span>Mostrar cuánto puedes gastar hoy</span></label>" +
-        '<p class="ayuda" style="margin:4px 0 0">Con presupuesto, el widget muestra lo que puedes gastar por día; sin presupuesto, lo disponible del mes. Ese monto se ve en tu pantalla de inicio y queda legible en el teléfono. Apagado, el widget muestra solo el botón.</p></div>');
+      (PLATAFORMA !== "android" && PLATAFORMA !== "ios" ? "" : '<h2>Widget</h2><div class="card" style="padding:14px 16px">' +
+        (PLATAFORMA === "ios" && E.widgetGrupo === false ? '<p class="error" style="margin:0 0 8px">Tu iPhone no dejó que la app comparta datos con el widget (pasa al instalar con un Apple ID gratis): el widget muestra Gasto e Ingreso, pero no el resumen ni los botones rápidos. Con la cuenta de Apple Developer funciona completo.</p>' : "") +
+        '<p class="ayuda" style="margin:0 0 6px">' + (PLATAFORMA === "ios"
+          ? 'Mantén presionada la pantalla de inicio → <i>Editar</i> → <i>Agregar widget</i> → <i>Mis Finanzas</i> (también en la pantalla bloqueada). Sus botones anotan sin escribir tu clave.'
+          : 'Mantén presionada la pantalla de inicio → <i>Widgets</i> → <i>Mis Finanzas</i>. Su botón <b>Anotar gasto</b> anota sin escribir tu clave.') + '</p>' +
+        '<label style="display:flex;gap:12px;align-items:center;min-height:44px;cursor:pointer;font-weight:600"><input type="checkbox" style="width:22px;height:22px;flex:none;accent-color:var(--a)" onchange="FALocal.widgetSaldo(this.checked)"' + (E.widgetSaldo ? " checked" : "") + "><span>Mostrar el resumen del mes</span></label>" +
+        '<p class="ayuda" style="margin:4px 0 0">Lo que puedes gastar hoy (o lo disponible del mes) y, según el tamaño del widget, cuánto llevas gastado, tus ingresos, el avance del presupuesto y la categoría con más gasto. Esos montos se ven en tu pantalla de inicio y quedan legibles en el teléfono. Apagado, el widget muestra solo los botones para anotar.</p>' +
+        (PLATAFORMA !== "ios" && PLATAFORMA !== "android" ? "" :
+        '<label style="display:flex;gap:12px;align-items:center;min-height:44px;cursor:pointer;font-weight:600;margin-top:10px"><input type="checkbox" style="width:22px;height:22px;flex:none;accent-color:var(--a)" onchange="FALocal.widgetRapido(this.checked)"' + (E.widgetRapido ? " checked" : "") + "><span>Registro rápido desde el widget</span></label>" +
+        '<p class="ayuda" style="margin:4px 0 0">Botones con lo que más repites (por ejemplo «Café $2.500») para anotarlo con un toque desde el widget, sin abrir la app' + (PLATAFORMA === "ios" ? ' (iOS 17 o más nuevo)' : '') + '. Sus nombres y montos quedan legibles en el teléfono; lo que anotas se guarda cifrado y se suma al entrar con tu clave.</p>') + '</div>');
+  }
+
+  // Respaldo automático (3.8): solo en la app nativa
+  function bloqueAuto() {
+    if (!NATIVO) return "";
+    const dias = diasDesde(E.autoUltimo), donde = PLATAFORMA === "ios" ? "Archivos → En mi iPhone → Mis Finanzas" : (E.autoDir === "DATA" ? "la carpeta interna de la app" : "Documentos/MisFinanzas");
+    return '<label style="display:flex;gap:12px;align-items:center;min-height:44px;margin-top:12px;cursor:pointer;font-weight:600"><input type="checkbox" style="width:22px;height:22px;flex:none;accent-color:var(--a)" onchange="FALocal.autoRespaldo(this.checked)"' + (E.autoRespaldo === false ? "" : " checked") + "><span>Respaldo automático cada día</span></label>" +
+      '<p class="ayuda" style="margin:4px 0 0">Al abrir la app, una vez al día, guarda una copia cifrada con tu clave de la app en ' + esc(donde) + ' (quedan las 7 últimas). ' +
+      (PLATAFORMA === "ios" ? "Esa carpeta entra en el respaldo de iCloud del iPhone. " : "Si el respaldo de Google del teléfono está activado, también guarda los datos de la app. ") +
+      "Se restaura con «Restaurar un respaldo» y tu clave. Igual conviene guardar de vez en cuando un respaldo fuera del teléfono." +
+      (E.autoUltimo ? " <b>Último: " + (dias === 0 ? "hoy" : "hace " + dias + (dias === 1 ? " día" : " días")) + ".</b>" : "") + "</p>" +
+      '<button class="btn btn-bloque" style="margin-top:8px" onclick="FALocal.respaldoAhora(this)"><i class="ti ti-device-floppy"></i>Hacer el respaldo automático ahora</button>';
+  }
+  // Avisos del banco (3.8, Android): ver AvisosBanco.java
+  function bloqueAvisosBanco() {
+    if (PLATAFORMA !== "android") return "";
+    const st = E.avisosBanco || {};
+    return '<h2>Anotar con los avisos del banco</h2><div class="card" style="padding:14px 16px">' +
+      '<p class="ayuda" style="margin:0 0 6px">Cuando la app de tu banco avisa una compra o un abono («Compra por $12.990 en LIDER»), Mis Finanzas lo anota solo, cifrado y sin categoría. Al entrar eliges la categoría (te sugiere una) o tocas <b>No anotar</b>. ' +
+      "Se lee en el teléfono: del aviso solo se guardan el monto, el comercio y la fecha, y nada se envía. Solo se leen avisos de apps de bancos y billeteras.</p>" +
+      '<label style="display:flex;gap:12px;align-items:center;min-height:44px;cursor:pointer;font-weight:600"><input type="checkbox" style="width:22px;height:22px;flex:none;accent-color:var(--a)" onchange="FALocal.avisosBanco(this.checked)"' + (st.on ? " checked" : "") + "><span>Anotar compras avisadas por mi banco</span></label>" +
+      (st.on && !st.permiso ? '<p class="error" style="margin:6px 0">Falta el permiso: en la pantalla que se abre, activa <b>Mis Finanzas</b> y vuelve.</p><button class="btn btn-p btn-bloque" onclick="FALocal.permisoAvisos()"><i class="ti ti-shield-check"></i>Dar permiso de avisos</button>' : "") +
+      (st.on && st.permiso ? '<p class="ayuda" style="margin:6px 0 0;color:var(--ok)">Activo. Revisa que tu banco tenga los avisos de compra encendidos en su app.</p>' : "") + "</div>";
+  }
+  // Apple Pay (3.8, iPhone): la automatización «Transacción» de la app Atajos llama a «Anotar compra con tarjeta»
+  function bloqueApplePay() {
+    if (PLATAFORMA !== "ios") return "";
+    return '<h2>Anotar solo al pagar con Apple Pay</h2><div class="card" style="padding:14px 16px">' +
+      '<p class="ayuda" style="margin:0 0 8px">Con iOS 17 o más nuevo, cada vez que pagas acercando el iPhone (o el reloj) se puede anotar el gasto sin tocar nada. Se configura una vez en la app <b>Atajos</b>:</p>' +
+      '<ol class="ayuda" style="margin:0 0 8px;padding-left:20px;line-height:1.55">' +
+      "<li>Abre <b>Atajos</b> → <b>Automatización</b> → <b>Nueva automatización</b> → <b>Transacción</b>.</li>" +
+      "<li>Elige tus tarjetas y marca <b>Ejecutar inmediatamente</b>.</li>" +
+      "<li>Agrega la acción <b>Anotar compra con tarjeta</b> (de Mis Finanzas) y, en sus campos, elige los datos de la transacción: el importe, el comercio y la tarjeta.</li></ol>" +
+      '<p class="ayuda" style="margin:0">El gasto queda cifrado y sin categoría: al entrar la eliges (te sugiere una según el comercio). Solo funciona con pagos sin contacto con Apple Pay, no con compras en internet ni con la tarjeta física.</p></div>';
   }
 
   window.FALocal = {
+    autoRespaldo(si) {
+      E.autoRespaldo = !!si;
+      escribir("autoRespaldo", { on: E.autoRespaldo, ultimo: E.autoUltimo || "", dir: E.autoDir || "" }).catch(() => {});
+      avisar(si ? "Respaldo automático activado" : "Respaldo automático apagado");
+      if (si) respaldoAuto(false).catch(e => anotarFalla("respaldo auto: " + e.message));
+    },
+    async respaldoAhora(b) {
+      if (b) b.disabled = true;
+      try { const r = await respaldoAuto(true); avisar(r ? "Respaldo guardado: " + r.nombre : "No se pudo hacer el respaldo."); }
+      catch (e) { anotarFalla("respaldo auto: " + (e && e.message)); avisar("No se pudo guardar el respaldo en el teléfono."); }
+      if (b) b.disabled = false;
+    },
+    async avisosBanco(si) {
+      try { E.avisosBanco = await plugin("Widget").avisosBanco({ on: !!si }); } catch (e) { anotarFalla("avisos banco: " + e.message); }
+      refrescarAjustes();
+      if (si && E.avisosBanco && !E.avisosBanco.permiso) FALocal.permisoAvisos();
+    },
+    permisoAvisos() { plugin("Widget").permisoAvisos().catch(e => anotarFalla("avisos banco: " + e.message)); },
     ajustes() {
       if (!E.motor) return "";
       const dias = diasDesde(E.respaldo), movs = contarMovs(true), pend = porEnviar().length;
@@ -856,17 +1026,18 @@
         '<p class="ayuda" style="margin:0 0 10px">Tus datos viven solo en este teléfono. Si se borra el navegador o cambias de celular, sin respaldo se pierden. El archivo de respaldo va cifrado con una contraseña que eliges. ' +
         '<b' + (urgente ? ' style="color:var(--warn)"' : "") + ">" + esc(estadoResp) + "</b></p>" +
         '<div class="acc" style="margin:0"><button class="btn btn-p btn-bloque" onclick="FALocal.respaldar(this)"><i class="ti ti-download"></i>Guardar respaldo</button>' +
-        '<button class="btn btn-bloque" onclick="FALocal.restaurar(this)"><i class="ti ti-upload"></i>Restaurar un respaldo</button></div></div>' +
+        '<button class="btn btn-bloque" onclick="FALocal.restaurar(this)"><i class="ti ti-upload"></i>Restaurar un respaldo</button></div>' + bloqueAuto() + '</div>' +
 
         '<h2>Clave y cifrado</h2><div class="card" style="padding:14px 16px">' +
         '<p class="ayuda" style="margin:0 0 10px">Tus datos se guardan cifrados (AES-256) en este teléfono: sin tu clave no se pueden leer, aunque alguien copie el almacenamiento. ' +
         "La app la pide al abrirla y al volver después de un minuto. Una clave con letras y números es mucho más difícil de adivinar que solo números.</p>" +
         '<button class="btn btn-bloque" onclick="FALocal.formClave()"><i class="ti ti-key"></i>Cambiar clave</button>' + bloqueHuella() + "</div>" +
 
-        bloqueAvisos() +
+        bloqueAvisos() + bloqueAvisosBanco() + bloqueApplePay() +
 
         '<h2>Atajos</h2><div class="card" style="padding:14px 16px"><p class="ayuda" style="margin:0 0 10px">' +
-        (PLATAFORMA === "ios" ? "" : "Android: mantén presionado el ícono de Mis Finanzas y elige <i>Anotar gasto</i> o <i>Anotar ingreso</i> (arrástralo a la pantalla de inicio para tenerlo a mano). ") +
+        (PLATAFORMA === "ios" ? "iPhone: mantén presionado el ícono de Mis Finanzas y elige <i>Anotar gasto</i> o <i>Anotar ingreso</i>. "
+                              : "Android: mantén presionado el ícono de Mis Finanzas y elige <i>Anotar gasto</i> o <i>Anotar ingreso</i> (arrástralo a la pantalla de inicio para tenerlo a mano). ") +
         "Desde un atajo anotas <b>sin escribir tu clave</b>: lo anotado queda cifrado y se suma a tus cuentas la próxima vez que entres. " +
         "Para la app Atajos del iPhone o un widget de Android («Abrir URL»), copia el enlace de lo que anotas seguido: anota con un toque.</p>" +
         ((window.D && window.D.recientes && window.D.recientes.length) ? '<div class="lista">' + window.D.recientes.map((x, i) =>
@@ -942,16 +1113,19 @@
         try { r = JSON.parse(await f.text()); } catch (e) { avisar("Ese archivo no es un respaldo de Mis Finanzas."); return; }
         if (!r || r.app !== "Mis Finanzas") { avisar("Ese archivo no es un respaldo de Mis Finanzas."); return; }
         if (r.formato === 2 && r.cifrado && r.datos) { FALocal._pendiente = r; FALocal.pedirContrasena(); return; }
+        if (r.formato === 3 && r.llave && r.datos) { FALocal._pendiente = r; FALocal.pedirContrasena(true); return; }
         if (!respaldoValido(r)) { avisar("Ese archivo no es un respaldo de Mis Finanzas."); return; }
         if (!confirm("Este respaldo NO está cifrado (es de una versión anterior). Al restaurarlo, sus datos quedan cifrados en el teléfono; borra después el archivo. ¿Seguir?")) return;
         await aplicarRespaldo(r, r.creado);
       };
       i.click();
     },
-    pedirContrasena() {
+    pedirContrasena(auto) {
       window.abrirHoja("Restaurar respaldo",
-        '<p class="ayuda" style="margin:0 0 12px">Escribe la contraseña con que se guardó este respaldo.</p>' +
-        '<div class="campo"><label for="fa-rr">Contraseña del respaldo</label><input class="inp" id="fa-rr" type="password" autocomplete="current-password"></div>' +
+        (auto ? '<p class="ayuda" style="margin:0 0 12px">Es un respaldo automático: se abre con la clave de la app que tenías cuando se hizo.</p>' +
+          '<div class="campo"><label for="fa-rr">Clave de la app</label><input class="inp" id="fa-rr" type="password" autocomplete="current-password"></div>'
+          : '<p class="ayuda" style="margin:0 0 12px">Escribe la contraseña con que se guardó este respaldo.</p>' +
+          '<div class="campo"><label for="fa-rr">Contraseña del respaldo</label><input class="inp" id="fa-rr" type="password" autocomplete="current-password"></div>') +
         '<div class="error" id="fa-rr-err"></div>',
         '<button class="btn btn-p btn-bloque" onclick="FALocal.abrirRespaldo(this)"><i class="ti ti-lock-open"></i>Abrir respaldo</button>');
       setTimeout(() => { const x = document.getElementById("fa-rr"); if (x) x.focus(); }, 80);
@@ -961,8 +1135,11 @@
       if (b) b.disabled = true;
       let interior = null;
       try {
-        const llave = await derivar(document.getElementById("fa-rr").value, deB64(r.cifrado.sal), Number(r.cifrado.iter) || ITER);
-        interior = JSON.parse(await descifrar(llave, { iv: r.cifrado.iv, ct: r.datos }));
+        if (r.formato === 3) interior = JSON.parse(await descifrar(await desenvolver(r.llave, document.getElementById("fa-rr").value, false), r.datos));
+        else {
+          const llave = await derivar(document.getElementById("fa-rr").value, deB64(r.cifrado.sal), Number(r.cifrado.iter) || ITER);
+          interior = JSON.parse(await descifrar(llave, { iv: r.cifrado.iv, ct: r.datos }));
+        }
       } catch (e) { err.textContent = "Contraseña incorrecta (o el archivo está dañado)."; if (b) b.disabled = false; return; }
       if (!respaldoValido(interior)) { err.textContent = "El respaldo no tiene el formato esperado."; if (b) b.disabled = false; return; }
       FALocal._pendiente = null; window.cerrarHoja();
@@ -1072,9 +1249,14 @@
     async widgetSaldo(si) {
       E.widgetSaldo = !!si; await escribir("widgetSaldo", !!si);
       actualizarWidget(window.D); refrescarAjustes();
-      avisar(si ? "El widget mostrará cuánto puedes gastar hoy" : "El widget muestra solo el botón");
+      avisar(si ? "El widget mostrará el resumen del mes" : "El widget muestra solo los botones para anotar");
     },
-    avisosDe: avisosDe, leerTimbre: leerTimbre, widgetDe: widgetDe,   // para las pruebas
+    async widgetRapido(si) {
+      E.widgetRapido = !!si; await escribir("widgetRapido", !!si);
+      actualizarWidget(window.D); refrescarAjustes();
+      avisar(si ? (rapidosDe(window.D).length ? "El widget tendrá botones para anotar con un toque" : "Cuando repitas un gasto 2 veces, aparecerá en el widget") : "El widget ya no muestra botones rápidos");
+    },
+    avisosDe: avisosDe, leerTimbre: leerTimbre, widgetDe: widgetDe, rapidosDe: rapidosDe,   // para las pruebas
     copiarAtajo(i) { const x = window.D && window.D.recientes && window.D.recientes[i]; if (x) FALocal.copiar(FALocal.enlace(x)); },
     async copiar(texto) {
       try { await navigator.clipboard.writeText(texto); avisar("Enlace copiado. Pégalo en «Abrir URL» de tu app de atajos."); }
@@ -1117,11 +1299,14 @@
     "@keyframes fa-in-carga{0%{transform:scaleX(0)}100%{transform:scaleX(1)}}" +
     "@media (prefers-reduced-motion:reduce){#fa-intro *,#fa-intro *::before,#fa-intro *::after{animation:none!important;opacity:1!important}" +
       "#fa-intro .in-logo::after,#fa-intro .in-brillo{display:none}#fa-intro.fuera .in-logo{transform:none}}";
+  // se cumple cuando la presentación terminó (o no se mostró): recién ahí se abre el teclado de la clave
+  let introListo; const finIntro = new Promise(r => { introListo = r; });
+  setTimeout(() => introListo(), 3500);   // por si algo falla, nunca se queda esperando
   function presentacion() {
     try {
-      if (q.get("a") || GUARDAR_DIRECTO || navigator.webdriver || sessionStorage.getItem("fa_intro")) return;   // webdriver: las pruebas automáticas
+      if (q.get("a") || GUARDAR_DIRECTO || navigator.webdriver || sessionStorage.getItem("fa_intro")) { introListo(); return; }   // webdriver: las pruebas automáticas
       sessionStorage.setItem("fa_intro", "1");
-    } catch (e) { return; }
+    } catch (e) { introListo(); return; }
     const quieto = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
     const st = document.createElement("style"); st.textContent = INTRO_CSS; document.head.appendChild(st);
     const v = document.createElement("div");
@@ -1134,13 +1319,13 @@
     const salir = () => {
       if (fin) return; fin = true;
       v.classList.add("fuera");
-      setTimeout(() => { v.remove(); st.remove(); }, 480);
+      setTimeout(() => { v.remove(); st.remove(); introListo(); }, 480);
     };
     v.addEventListener("pointerdown", salir);
     if (!quieto) setTimeout(() => { try { if (window.FA_vibrar) window.FA_vibrar(); } catch (e) {} }, 650);
     setTimeout(salir, quieto ? 1100 : 2050);   // + 0,45 s de salida: todo dura menos de 3 s
     // en la app nativa, si se abrió desde el atajo para anotar, se quita apenas se sepa
-    if (NATIVO) enlaceAtajo().then(si => { if (si) { fin = true; v.remove(); st.remove(); } }, () => {});
+    if (NATIVO) enlaceAtajo().then(si => { if (si) { fin = true; v.remove(); st.remove(); introListo(); } }, () => {});
   }
   async function enlaceAtajo() {
     try { const u = sessionStorage.getItem("fa_enlace_nuevo") || ((await plugin("App").getLaunchUrl()) || {}).url || ""; return /anotar|registrar/.test(u); }
