@@ -23,7 +23,8 @@
   window.addEventListener("unhandledrejection", e => anotarFalla("promesa: " + ((e.reason && e.reason.message) || e.reason)));
   // La pantalla parte tapada hasta poner la clave (sin dejar ver nada ni un instante)
   document.documentElement.classList.add("fa-bloqueada");
-  document.write("<style>.fa-bloqueada body>*:not(#fa-bloqueo){visibility:hidden}</style>");
+  // y con el azul de la presentación de fondo, para que el arranque no muestre un destello blanco (3.9)
+  document.write("<style>.fa-bloqueada body>*:not(#fa-bloqueo){visibility:hidden}html.fa-bloqueada,html.fa-bloqueada body{background:#0A1F38}</style>");
 
   const BASE = "mis-finanzas-telefono", ALMACEN = "kv";
   const DIAS_AVISO_RESPALDO = 7;
@@ -122,23 +123,36 @@
     for (const o of lista) if (o && o.iv && o.ct && o.epk) await sumarABandeja(o);
   }
   // Con la app abierta: suma la bandeja. Lo que no calza (una categoría que ya no existe) se abre en el registro, de a uno.
+  // medio de pago para lo que llega sin medio: el último que usaste (o Débito)
+  function medioPorDefecto() {
+    let m = ""; try { m = localStorage.getItem("fa_medio") || ultimoMedio(); } catch (e) {}
+    const D = window.D, medios = (D && D.medios) || [];
+    return medios.indexOf(m) >= 0 ? m : (medios.indexOf("Débito") >= 0 ? "Débito" : (medios[0] || "Débito"));
+  }
   async function vaciarBandeja() {
     const lista = (await leer("bandeja")) || [], privC = await leer("bandejaPriv");
     if (!lista.length || !privC) return;
     const priv = await crypto.subtle.importKey("pkcs8", deB64(await descifrar(E.dek, privC)), ECDH, false, ["deriveKey"]);
-    let ok = 0; const quedan = [], revisar = [];
+    let ok = 0, solos = 0; const quedan = [], revisar = [];
     for (const o of lista) {
       let d;
       try { d = JSON.parse(await descifrar(await llaveComun(priv, await crypto.subtle.importKey("jwk", o.epk, ECDH, false, []), "decrypt"), o)); }
       catch (e) { anotarFalla("bandeja: " + e.message); continue; }   // dañado: no se podrá leer nunca
+      // sin categoría pero con descripción (Apple Pay, Google Wallet, aviso del banco): si se reconoce, se clasifica sola (3.9)
+      let auto = false;
+      if (!d.categoria && d.nota) {
+        try { const c = E.motor.llamar("sugerirCategoria", [d.nota, d.tipo || "Gasto"]); if (c && c.categoria) { d.categoria = c.categoria; auto = true; } } catch (e) {}
+        if (auto && (d.tipo || "Gasto") === "Gasto" && !d.medio) d.medio = medioPorDefecto();
+      }
       let r; try { r = E.motor.llamar("registrar", [d]); } catch (e) { r = null; }
-      if (r && r.ok) ok++;
+      if (r && r.ok) { ok++; if (auto) solos++; }
+      else if (auto) { delete d.categoria; }
       else { quedan.push(o); revisar.push({ d: d, iv: o.iv }); }   // sin categoría (o una que ya no existe): se completa en el registro
     }
     if (ok) await guardarLibro();
     // se quitan los procesados; lo que llegó mientras tanto se conserva
     await kv("readwrite", s => { const r = s.get("bandeja"); r.onsuccess = () => s.put(quedan.concat((r.result || []).slice(lista.length)), "bandeja"); return r; });
-    if (ok) setTimeout(() => avisar(ok === 1 ? "Se sumó 1 movimiento anotado con el atajo" : "Se sumaron " + ok + " movimientos anotados con el atajo"), 1200);
+    if (ok) setTimeout(() => avisar((ok === 1 ? "Se sumó 1 movimiento anotado sin abrir la app" : "Se sumaron " + ok + " movimientos anotados sin abrir la app") + (solos ? " (" + (solos === 1 ? "1 clasificado solo" : solos + " clasificados solos") + ")" : "")), 1200);
     if (revisar.length) { E.revision = revisar; setTimeout(siguienteRevision, ok ? 3500 : 600); }
   }
   // Lo anotado sin categoría se abre en el registro, de a uno: al guardarlo sale de la bandeja y se abre el siguiente.
@@ -799,18 +813,7 @@
     }
     return { c: "huella", t: "tu huella", l: "la huella", ico: "ti-fingerprint", off: "ti-fingerprint-off", ios: false };
   }
-  function bloqueHuella() {
-    const d = E.huellaDisp, b = bio();
-    if (!d || d.motivo === "sin-lector" || d.motivo === "otro") return "";
-    if (!d.disponible) return '<p class="ayuda" style="margin:12px 0 0">' + (PLATAFORMA === "ios"
-      ? "Para entrar con Face ID, primero actívalo en Ajustes del iPhone → Face ID y código."
-      : "Para entrar con huella, primero registra una huella en los ajustes del teléfono.") + "</p>";
-    return '<p class="ayuda" style="margin:12px 0 10px">' + (E.huellaActiva
-      ? "Entras con " + b.t + ". Tu clave sigue sirviendo, y se pide si " + b.l + " falla."
-      : "Entra con " + b.t + " en vez de escribir la clave. La llave queda en el chip de seguridad del teléfono y solo se abre con " + b.t + ".") + "</p>" +
-      (E.huellaActiva ? '<button class="btn btn-bloque" onclick="FALocal.desactivarHuella(this)"><i class="ti ' + b.off + '"></i>Dejar de usar ' + b.l + '</button>'
-                      : '<button class="btn btn-bloque" onclick="FALocal.formHuella()"><i class="ti ' + b.ico + '"></i>Entrar con ' + b.c + '</button>');
-  }
+
   // modo "crear" (primera vez o datos sin cifrar de antes) o "abrir"; resuelve con la llave de datos
   function pedirClave(modo, hayDatos) {
     return new Promise(resolver => {
@@ -936,69 +939,144 @@
     try { E.avisosBanco = await plugin("Widget").estadoAvisosBanco(); } catch (e) { E.avisosBanco = null; }
     refrescarAjustes();
   }
+  /* ── Ajustes (3.9): filas cortas con su estado; cada una abre una ventana con lo justo ── */
+  const sw = (on, fn, titulo, sub, id) => '<label class="sw"><span><b>' + titulo + "</b>" + (sub ? "<small>" + sub + "</small>" : "") + "</span>" +
+    '<input type="checkbox"' + (id ? ' id="' + id + '"' : "") + ' onchange="' + fn + '"' + (on ? " checked" : "") + "></label>";
+  const pasos = l => '<ol class="pasos">' + l.map(x => "<li>" + x + "</li>").join("") + "</ol>";
+  const nota = t => '<p class="ayuda" style="margin:8px 0 0">' + t + "</p>";
+  function diasDesde(isoTxt) { return isoTxt ? Math.floor((Date.now() - new Date(isoTxt).getTime()) / 86400000) : null; }
+  const haceTxt = d => (d === null ? "" : d === 0 ? "hoy" : "hace " + d + (d === 1 ? " día" : " días"));
+  function fila(id, icono, color, titulo, sub, aviso) {
+    return '<button class="fila toca menu-f" onclick="FALocal.hoja(\'' + id + '\')">' + window.ico(icono, color) + '<span class="tx"><b>' + titulo +
+      "</b><small" + (aviso ? ' class="rojo"' : "") + ">" + esc(sub) + '</small></span><i class="ti ti-chevron-right" aria-hidden="true"></i></button>';
+  }
+  function estadoRespaldo() {
+    const dias = diasDesde(E.respaldo), auto = NATIVO && E.autoRespaldo !== false;
+    const urgente = !auto && contarMovs(true) && (dias === null || dias >= DIAS_AVISO_RESPALDO);
+    return { urgente: urgente, sub: auto ? "Automático" + (E.autoUltimo ? " · " + haceTxt(diasDesde(E.autoUltimo)) : "") : (E.respaldo ? "Último " + haceTxt(dias) : "Nunca") };
+  }
+  const HOJAS = {
+    respaldo: () => ["Respaldo",
+      nota("Tus datos viven solo en este teléfono.").replace("margin:8px 0 0", "margin:0 0 6px") +
+      (NATIVO ? sw(E.autoRespaldo !== false, "FALocal.autoRespaldo(this.checked)", "Respaldo automático",
+        "Cada día, en " + (PLATAFORMA === "ios" ? "Archivos → Mis Finanzas" : "Documentos/MisFinanzas") + ". Se abre con tu clave." + (E.autoUltimo ? " Último: " + haceTxt(diasDesde(E.autoUltimo)) + "." : "")) : "") +
+      '<div class="acc" style="margin-top:10px"><button class="btn btn-p btn-bloque" onclick="FALocal.respaldar(this)"><i class="ti ti-download"></i>Guardar respaldo</button>' +
+      '<button class="btn btn-bloque" onclick="FALocal.restaurar(this)"><i class="ti ti-upload"></i>Restaurar</button></div>' +
+      nota("«Guardar respaldo» crea un archivo cifrado con una contraseña: guárdalo fuera del teléfono (Drive, correo)." + (E.respaldo ? " Último: " + haceTxt(diasDesde(E.respaldo)) + "." : "")) +
+      (NATIVO ? '<button class="btn btn-bloque" style="margin-top:10px" onclick="FALocal.respaldoAhora(this)"><i class="ti ti-device-floppy"></i>Hacer el automático ahora</button>' : "")],
+    clave: () => {
+      const d = E.huellaDisp, b = bio(), hay = d && d.motivo !== "sin-lector" && d.motivo !== "otro";
+      return ["Clave" + (hay ? " y " + b.c : ""),
+        nota("Tus datos van cifrados con tu clave. Mejor con letras y números.").replace("margin:8px 0 0", "margin:0 0 10px") +
+        '<button class="btn btn-bloque" onclick="FALocal.formClave()"><i class="ti ti-key"></i>Cambiar clave</button>' +
+        (!hay ? "" : !d.disponible ? nota(PLATAFORMA === "ios" ? "Para usar Face ID, actívalo primero en Ajustes del iPhone → Face ID y código." : "Para usar la huella, registra una primero en los ajustes del teléfono.")
+          : E.huellaActiva ? '<button class="btn btn-bloque" style="margin-top:10px" onclick="FALocal.desactivarHuella(this)"><i class="ti ' + b.off + '"></i>Dejar de usar ' + b.l + "</button>" + nota("Entras con " + b.t + "; la clave sigue sirviendo.")
+          : '<button class="btn btn-p btn-bloque" style="margin-top:10px" onclick="FALocal.formHuella()"><i class="ti ' + b.ico + '"></i>Entrar con ' + b.c + "</button>")];
+    },
+    avisos: () => {
+      const o = E.avisos;
+      const horas = [0].concat(Array.from({ length: 16 }, (_, i) => i + 8)).map(h => '<option value="' + h + '"' + (h === o.hora ? " selected" : "") + ">" + (h ? h + ":00" : "No") + "</option>").join("");
+      return ["Avisos", sw(o.on, "FALocal.avisos('on', this.checked)", "Avisos en este teléfono", "Sin internet: se calculan aquí.") +
+        (o.on ? '<div class="campo" style="margin-top:6px"><label for="fa-av-h">Recordatorio diario (si ese día no anotaste)</label><select class="inp" id="fa-av-h" onchange="FALocal.avisos(\'hora\', Number(this.value))">' + horas + "</select></div>" +
+          sw(o.pagos, "FALocal.avisos('pagos', this.checked)", "Pagos que vencen", "El día antes, a las 9:00.") +
+          sw(o.respaldo, "FALocal.avisos('respaldo', this.checked)", "Recordar el respaldo", "Cada 7 días.") +
+          sw(o.detalle, "FALocal.avisos('detalle', this.checked)", "Mostrar nombres y montos", "Apagado, el aviso dice solo «Mañana vence un pago».") : "")];
+    },
+    widget: () => ["Widget",
+      pasos(PLATAFORMA === "ios" ? ["Mantén presionada la pantalla de inicio.", "Toca <b>Editar</b> → <b>Agregar widget</b>.", "Elige <b>Mis Finanzas</b> (también sirve en la pantalla bloqueada)."]
+        : ["Mantén presionada la pantalla de inicio.", "Toca <b>Widgets</b>.", "Elige <b>Mis Finanzas</b>."]) +
+      (PLATAFORMA === "ios" && E.widgetGrupo === false ? '<p class="error" style="margin:0 0 8px">Con un Apple ID gratis, el widget solo trae los botones Gasto e Ingreso.</p>' : "") +
+      sw(E.widgetSaldo, "FALocal.widgetSaldo(this.checked)", "Mostrar el resumen del mes", "Cuánto puedes gastar hoy y más. Se ve en tu pantalla.") +
+      sw(E.widgetRapido, "FALocal.widgetRapido(this.checked)", "Botones con lo que más repites", "«Café $2.500» con un toque. Sus nombres quedan visibles.")],
+    atajos: () => {
+      const r = (window.D && window.D.recientes) || [];
+      return ["Atajos",
+        pasos(["Mantén presionado el ícono de Mis Finanzas.", "Elige <b>Anotar gasto</b> o <b>Anotar ingreso</b>."]) +
+        nota("Anotas sin tu clave: queda cifrado y se suma al entrar.").replace("margin:8px 0 0", "margin:0 0 6px") +
+        sw(E.nombresAtajo !== false, "FALocal.nombresAtajo(this.checked)", "Mostrar mis categorías", "Apagado, eliges la categoría al entrar.", "fa-nombres") +
+        '<div class="etq">Enlaces de un toque</div>' +
+        (r.length ? '<div class="card lista">' + r.map((x, i) => '<button class="fila toca" onclick="FALocal.copiarAtajo(' + i + ')"><span class="tx"><b>' + esc(x.nota || x.categoria) +
+          "</b><small>" + esc(x.tipo + " · $" + Number(x.monto).toLocaleString("es-CL")) + '</small></span><i class="ti ti-copy" aria-hidden="true"></i></button>').join("") + "</div>"
+          : nota("Lo que anotes igual dos veces aparecerá aquí para copiar su enlace.").replace("margin:8px 0 0", "margin:0")) +
+        '<button class="btn btn-bloque" style="margin-top:10px" onclick="FALocal.copiar(FALocal.enlace({}))"><i class="ti ti-link"></i>Copiar enlace «Anotar gasto»</button>' +
+        nota("Pega el enlace en «Abrir URL» de la app Atajos o de un widget.")];
+    },
+    siri: () => ["Siri", nota("Dile a Siri (sirve con el iPhone bloqueado):").replace("margin:8px 0 0", "margin:0 0 6px") +
+      '<ul class="frases"><li>«Anotar gasto en Mis Finanzas»</li><li>«Anotar gasto de Comida fuera en Mis Finanzas»</li><li>«Anotar ingreso en Mis Finanzas»</li><li>«¿Cuánto puedo gastar hoy en Mis Finanzas?»</li><li>«¿Cuánto me deben en Mis Finanzas?»</li></ul>' +
+      nota("También aparecen en Spotlight, el botón de Acción y la app Atajos.")],
+    applepay: () => ["Anotar al pagar con Apple Pay",
+      pasos(["Abre <b>Atajos</b> → <b>Automatización</b> → <b>Nueva</b> → <b>Transacción</b>.", "Elige tus tarjetas y <b>Ejecutar inmediatamente</b>.",
+        "Agrega <b>Anotar compra con tarjeta</b> (Mis Finanzas) y pon el importe, el comercio y la tarjeta de la transacción."]) +
+      nota("Cada pago sin contacto queda anotado y se clasifica solo por el comercio (Lider → Supermercado). Si no lo reconoce, eliges la categoría al entrar. Necesita iOS 17.")],
+    banco: () => {
+      const st = E.avisosBanco || {};
+      return ["Avisos del banco",
+        sw(st.on, "FALocal.avisosBanco(this.checked)", "Anotar lo que avisa mi banco", "También Google Wallet. «Compra por $12.990 en LIDER» queda anotado en Supermercado; lo que no reconoce, lo eliges al entrar.") +
+        (st.on && !st.permiso ? '<p class="error" style="margin:8px 0">Falta el permiso: activa <b>Mis Finanzas</b> y vuelve.</p><button class="btn btn-p btn-bloque" onclick="FALocal.permisoAvisos()"><i class="ti ti-shield-check"></i>Dar permiso</button>' : "") +
+        (st.on && st.permiso ? nota('<span style="color:var(--ok)">Activo.</span> Revisa que tu banco tenga encendidos los avisos de compra.') : "") +
+        nota("Se lee en el teléfono: solo se guardan monto, comercio y fecha, cifrados.")];
+    },
+    planilla: () => {
+      const pend = porEnviar().length;
+      return ["Copia en tu planilla",
+        nota("Opcional: si también usas Mis Finanzas en Google Sheets, pega el enlace de tu panel y envía los movimientos nuevos.").replace("margin:8px 0 0", "margin:0 0 8px") +
+        '<div class="campo"><label for="fa-planilla">Enlace de tu panel (termina en /exec)</label><input class="inp" id="fa-planilla" type="url" inputmode="url" autocomplete="off" placeholder="https://script.google.com/macros/s/…/exec" value="' + esc(E.planilla) + '"></div>' +
+        '<div class="error" id="fa-planilla-err"></div>' +
+        (E.errores.length ? '<p class="ayuda" style="color:var(--bad);margin:6px 0">No se pudieron enviar: ' + E.errores.slice(0, 5).map(x => esc(x.error)).join(" · ") + (E.errores.length > 5 ? "…" : "") + "</p>" : "") +
+        '<button class="btn btn-bloque" onclick="FALocal.enviar(this)"><i class="ti ti-cloud-upload"></i>' + (pend ? "Enviar " + pend + (pend === 1 ? " movimiento nuevo" : " movimientos nuevos") : "Enviar a la planilla") + "</button>" +
+        nota("Solo movimientos nuevos; las categorías, tarjetas y metas deben existir también en la planilla.")];
+    },
+    reportar: () => ["¿Algo no funcionó?",
+      '<div class="campo" style="margin-top:0"><label for="fa-rep">Qué hacías y qué pasó</label><textarea class="inp" id="fa-rep" rows="3" maxlength="1000" style="min-height:88px;resize:vertical"></textarea></div>' +
+      '<button class="btn btn-p btn-bloque" onclick="FALocal.reportar(this)"><i class="ti ti-message-report"></i>Enviar reporte</button>' +
+      nota("Lleva la versión, el tipo de teléfono y los errores técnicos recientes (" + FALLAS.length + "). Nunca tus datos ni montos.")],
+  };
+  let hojaAbierta = "";
   function refrescarAjustes() {
     if (window.S && window.S.vista === "mas" && typeof window.pintarVista === "function") window.pintarVista();
-  }
-  function diasDesde(isoTxt) { return isoTxt ? Math.floor((Date.now() - new Date(isoTxt).getTime()) / 86400000) : null; }
-  // Ajustes → Avisos (solo en la app nativa: la web no puede avisar con la app cerrada sin un servidor)
-  function bloqueAvisos() {
-    if (!NATIVO) return "";
-    const o = E.avisos;
-    const chk = (k, t) => '<label style="display:flex;gap:12px;align-items:center;min-height:44px;cursor:pointer;font-weight:600">' +
-      '<input type="checkbox" style="width:22px;height:22px;flex:none;accent-color:var(--a)" onchange="FALocal.avisos(\'' + k + '\', this.checked)"' + (o[k] ? " checked" : "") + "><span>" + t + "</span></label>";
-    const horas = [0].concat(Array.from({ length: 16 }, (_, i) => i + 8)).map(h => '<option value="' + h + '"' + (h === o.hora ? " selected" : "") + ">" + (h ? h + ":00" : "No") + "</option>").join("");
-    return '<h2>Avisos en este teléfono</h2><div class="card" style="padding:14px 16px">' +
-      '<p class="ayuda" style="margin:0 0 6px">Funcionan sin internet: se calculan en el teléfono y no se envía nada.</p>' + chk("on", "Activar avisos") +
-      (o.on ? '<div class="campo" style="margin-top:6px"><label for="fa-av-h">Recordatorio diario (no llega si ese día ya anotaste)</label><select class="inp" id="fa-av-h" onchange="FALocal.avisos(\'hora\', Number(this.value))">' + horas + "</select></div>" +
-        chk("pagos", "Pagos que vencen (tarjetas, deudas y fijos), el día antes") + chk("respaldo", "Recordarme el respaldo cada 7 días") + chk("detalle", "Mostrar nombres y montos en el aviso") +
-        '<p class="ayuda" style="margin:4px 0 0">Si no muestras nombres ni montos, el aviso solo dice «Mañana vence un pago»: quien vea tu pantalla bloqueada no sabe qué ni cuánto.</p>' : "") + "</div>" +
-      (PLATAFORMA !== "android" && PLATAFORMA !== "ios" ? "" : '<h2>Widget</h2><div class="card" style="padding:14px 16px">' +
-        (PLATAFORMA === "ios" && E.widgetGrupo === false ? '<p class="error" style="margin:0 0 8px">Tu iPhone no dejó que la app comparta datos con el widget (pasa al instalar con un Apple ID gratis): el widget muestra Gasto e Ingreso, pero no el resumen ni los botones rápidos. Con la cuenta de Apple Developer funciona completo.</p>' : "") +
-        '<p class="ayuda" style="margin:0 0 6px">' + (PLATAFORMA === "ios"
-          ? 'Mantén presionada la pantalla de inicio → <i>Editar</i> → <i>Agregar widget</i> → <i>Mis Finanzas</i> (también en la pantalla bloqueada). Sus botones anotan sin escribir tu clave.'
-          : 'Mantén presionada la pantalla de inicio → <i>Widgets</i> → <i>Mis Finanzas</i>. Su botón <b>Anotar gasto</b> anota sin escribir tu clave.') + '</p>' +
-        '<label style="display:flex;gap:12px;align-items:center;min-height:44px;cursor:pointer;font-weight:600"><input type="checkbox" style="width:22px;height:22px;flex:none;accent-color:var(--a)" onchange="FALocal.widgetSaldo(this.checked)"' + (E.widgetSaldo ? " checked" : "") + "><span>Mostrar el resumen del mes</span></label>" +
-        '<p class="ayuda" style="margin:4px 0 0">Lo que puedes gastar hoy (o lo disponible del mes) y, según el tamaño del widget, cuánto llevas gastado, tus ingresos, el avance del presupuesto y la categoría con más gasto. Esos montos se ven en tu pantalla de inicio y quedan legibles en el teléfono. Apagado, el widget muestra solo los botones para anotar.</p>' +
-        (PLATAFORMA !== "ios" && PLATAFORMA !== "android" ? "" :
-        '<label style="display:flex;gap:12px;align-items:center;min-height:44px;cursor:pointer;font-weight:600;margin-top:10px"><input type="checkbox" style="width:22px;height:22px;flex:none;accent-color:var(--a)" onchange="FALocal.widgetRapido(this.checked)"' + (E.widgetRapido ? " checked" : "") + "><span>Registro rápido desde el widget</span></label>" +
-        '<p class="ayuda" style="margin:4px 0 0">Botones con lo que más repites (por ejemplo «Café $2.500») para anotarlo con un toque desde el widget, sin abrir la app' + (PLATAFORMA === "ios" ? ' (iOS 17 o más nuevo)' : '') + '. Sus nombres y montos quedan legibles en el teléfono; lo que anotas se guarda cifrado y se suma al entrar con tu clave.</p>') + '</div>');
-  }
-
-  // Respaldo automático (3.8): solo en la app nativa
-  function bloqueAuto() {
-    if (!NATIVO) return "";
-    const dias = diasDesde(E.autoUltimo), donde = PLATAFORMA === "ios" ? "Archivos → En mi iPhone → Mis Finanzas" : (E.autoDir === "DATA" ? "la carpeta interna de la app" : "Documentos/MisFinanzas");
-    return '<label style="display:flex;gap:12px;align-items:center;min-height:44px;margin-top:12px;cursor:pointer;font-weight:600"><input type="checkbox" style="width:22px;height:22px;flex:none;accent-color:var(--a)" onchange="FALocal.autoRespaldo(this.checked)"' + (E.autoRespaldo === false ? "" : " checked") + "><span>Respaldo automático cada día</span></label>" +
-      '<p class="ayuda" style="margin:4px 0 0">Al abrir la app, una vez al día, guarda una copia cifrada con tu clave de la app en ' + esc(donde) + ' (quedan las 7 últimas). ' +
-      (PLATAFORMA === "ios" ? "Esa carpeta entra en el respaldo de iCloud del iPhone. " : "Si el respaldo de Google del teléfono está activado, también guarda los datos de la app. ") +
-      "Se restaura con «Restaurar un respaldo» y tu clave. Igual conviene guardar de vez en cuando un respaldo fuera del teléfono." +
-      (E.autoUltimo ? " <b>Último: " + (dias === 0 ? "hoy" : "hace " + dias + (dias === 1 ? " día" : " días")) + ".</b>" : "") + "</p>" +
-      '<button class="btn btn-bloque" style="margin-top:8px" onclick="FALocal.respaldoAhora(this)"><i class="ti ti-device-floppy"></i>Hacer el respaldo automático ahora</button>';
-  }
-  // Avisos del banco (3.8, Android): ver AvisosBanco.java
-  function bloqueAvisosBanco() {
-    if (PLATAFORMA !== "android") return "";
-    const st = E.avisosBanco || {};
-    return '<h2>Anotar con los avisos del banco</h2><div class="card" style="padding:14px 16px">' +
-      '<p class="ayuda" style="margin:0 0 6px">Cuando la app de tu banco avisa una compra o un abono («Compra por $12.990 en LIDER»), Mis Finanzas lo anota solo, cifrado y sin categoría. Al entrar eliges la categoría (te sugiere una) o tocas <b>No anotar</b>. ' +
-      "Se lee en el teléfono: del aviso solo se guardan el monto, el comercio y la fecha, y nada se envía. Solo se leen avisos de apps de bancos y billeteras.</p>" +
-      '<label style="display:flex;gap:12px;align-items:center;min-height:44px;cursor:pointer;font-weight:600"><input type="checkbox" style="width:22px;height:22px;flex:none;accent-color:var(--a)" onchange="FALocal.avisosBanco(this.checked)"' + (st.on ? " checked" : "") + "><span>Anotar compras avisadas por mi banco</span></label>" +
-      (st.on && !st.permiso ? '<p class="error" style="margin:6px 0">Falta el permiso: en la pantalla que se abre, activa <b>Mis Finanzas</b> y vuelve.</p><button class="btn btn-p btn-bloque" onclick="FALocal.permisoAvisos()"><i class="ti ti-shield-check"></i>Dar permiso de avisos</button>' : "") +
-      (st.on && st.permiso ? '<p class="ayuda" style="margin:6px 0 0;color:var(--ok)">Activo. Revisa que tu banco tenga los avisos de compra encendidos en su app.</p>' : "") + "</div>";
-  }
-  // Apple Pay (3.8, iPhone): la automatización «Transacción» de la app Atajos llama a «Anotar compra con tarjeta»
-  function bloqueApplePay() {
-    if (PLATAFORMA !== "ios") return "";
-    return '<h2>Anotar solo al pagar con Apple Pay</h2><div class="card" style="padding:14px 16px">' +
-      '<p class="ayuda" style="margin:0 0 8px">Con iOS 17 o más nuevo, cada vez que pagas acercando el iPhone (o el reloj) se puede anotar el gasto sin tocar nada. Se configura una vez en la app <b>Atajos</b>:</p>' +
-      '<ol class="ayuda" style="margin:0 0 8px;padding-left:20px;line-height:1.55">' +
-      "<li>Abre <b>Atajos</b> → <b>Automatización</b> → <b>Nueva automatización</b> → <b>Transacción</b>.</li>" +
-      "<li>Elige tus tarjetas y marca <b>Ejecutar inmediatamente</b>.</li>" +
-      "<li>Agrega la acción <b>Anotar compra con tarjeta</b> (de Mis Finanzas) y, en sus campos, elige los datos de la transacción: el importe, el comercio y la tarjeta.</li></ol>" +
-      '<p class="ayuda" style="margin:0">El gasto queda cifrado y sin categoría: al entrar la eliges (te sugiere una según el comercio). Solo funciona con pagos sin contacto con Apple Pay, no con compras en internet ni con la tarjeta física.</p></div>';
+    // si la ventana de ese ajuste sigue abierta, se repinta con el estado nuevo
+    const h = document.getElementById("hoja");
+    if (hojaAbierta && h && h.classList.contains("on") && HOJAS[hojaAbierta] && document.getElementById("hojaT").textContent === HOJAS[hojaAbierta]()[0]) {
+      const c = document.getElementById("hojaC"), y = c.scrollTop; c.innerHTML = HOJAS[hojaAbierta]()[1]; c.scrollTop = y;
+    }
   }
 
   window.FALocal = {
+    // las filas que el panel pone en Más → Ajustes (debajo de las generales)
+    ajustes() {
+      if (!E.motor) return "";
+      const b = bio(), d = E.huellaDisp, conBio = d && d.motivo !== "sin-lector" && d.motivo !== "otro", r = estadoRespaldo(), o = E.avisos || {}, st = E.avisosBanco || {};
+      const movil = PLATAFORMA === "android" || PLATAFORMA === "ios";
+      return '<p class="aj-t">Seguridad</p><div class="card lista menu">' +
+        fila("respaldo", "ti-cloud-upload", "#1F5C99", "Respaldo", r.sub, r.urgente) +
+        fila("clave", "ti-lock", "#3E546D", "Clave" + (conBio ? " y " + b.c : ""), E.huellaActiva ? b.c + " activo" : "Solo clave") + "</div>" +
+        '<p class="aj-t">Anotar rápido</p><div class="card lista menu">' +
+        fila("atajos", "ti-bolt", "#C47A1C", "Atajos", "Anotar sin abrir la app") +
+        (movil ? fila("widget", "ti-layout-grid", "#6A5BC7", "Widget", E.widgetSaldo ? "Con resumen del mes" : "Solo botones") : "") +
+        (PLATAFORMA === "ios" ? fila("siri", "ti-microphone", "#B5405F", "Siri", "«Anotar gasto en Mis Finanzas»") + fila("applepay", "ti-credit-card", "#078C7E", "Apple Pay", "Anotar al pagar") : "") +
+        (PLATAFORMA === "android" ? fila("banco", "ti-building-bank", "#078C7E", "Avisos del banco", st.on ? (st.permiso ? "Activo" : "Falta el permiso") : "Apagado", st.on && !st.permiso) : "") + "</div>" +
+        '<p class="aj-t">Este teléfono</p><div class="card lista menu">' +
+        (NATIVO ? fila("avisos", "ti-bell", "#D0613A", "Avisos", o.on ? (o.hora ? "Recordatorio a las " + o.hora + ":00" : "Pagos que vencen") : "Apagados") : "") +
+        (NATIVO ? "" : fila("planilla", "ti-table", "#2E9E5B", "Copia en tu planilla", porEnviar().length ? porEnviar().length + " por enviar" : "Opcional")) +
+        fila("reportar", "ti-message-report", "#6B7A8F", "¿Algo no funcionó?", "Envía un reporte") + "</div>";
+    },
+    hoja(id) {
+      const x = HOJAS[id] && HOJAS[id](); if (!x) return;
+      hojaAbierta = id;
+      window.abrirHoja(x[0], x[1], '<button class="btn btn-p" onclick="cerrarHoja()"><i class="ti ti-check"></i>Listo</button>');
+    },
+    // consejos para Inicio (de a uno): lo que aún no está configurado en este teléfono
+    consejos() {
+      const l = [], d = E.huellaDisp, b = bio(), r = estadoRespaldo();
+      if (r.urgente) l.push({ id: "respaldo", icono: "ti-cloud-upload", color: "#1F5C99", t: "Haz un respaldo", s: "Tus datos viven solo en este teléfono.", fn: () => FALocal.hoja("respaldo") });
+      if (d && d.disponible && !E.huellaActiva) l.push({ id: "bio", icono: b.ico, color: "#3E546D", t: "Entra con " + b.c, s: "Más rápido que escribir la clave.", fn: () => FALocal.formHuella() });
+      if (PLATAFORMA === "ios") l.push({ id: "applepay", icono: "ti-credit-card", color: "#078C7E", t: "Anota solo al pagar con Apple Pay", s: "Cada pago queda anotado y clasificado. Se configura una vez.", fn: () => FALocal.hoja("applepay"), fin: true });
+      if (PLATAFORMA === "android" && !(E.avisosBanco || {}).on) l.push({ id: "banco", icono: "ti-building-bank", color: "#078C7E", t: "Anota con los avisos de tu banco", s: "Y con Google Wallet: cada compra queda anotada y clasificada.", fn: () => FALocal.hoja("banco") });
+      if (PLATAFORMA === "android" || PLATAFORMA === "ios") l.push({ id: "widget", icono: "ti-layout-grid", color: "#6A5BC7", t: "Anota desde la pantalla de inicio", s: "Agrega el widget de Mis Finanzas.", fn: () => FALocal.hoja("widget"), fin: true });
+      l.push({ id: "atajos", icono: "ti-bolt", color: "#C47A1C", t: "Anota sin abrir la app", s: "Mantén presionado el ícono: Anotar gasto.", fn: () => FALocal.hoja("atajos"), fin: true });
+      if (NATIVO && !(E.avisos || {}).on) l.push({ id: "avisos", icono: "ti-bell", color: "#D0613A", t: "Que te recuerde anotar", s: "Y los pagos que vencen, sin internet.", fn: () => FALocal.hoja("avisos") });
+      return l;
+    },
     autoRespaldo(si) {
       E.autoRespaldo = !!si;
       escribir("autoRespaldo", { on: E.autoRespaldo, ultimo: E.autoUltimo || "", dir: E.autoDir || "" }).catch(() => {});
@@ -1017,53 +1095,6 @@
       if (si && E.avisosBanco && !E.avisosBanco.permiso) FALocal.permisoAvisos();
     },
     permisoAvisos() { plugin("Widget").permisoAvisos().catch(e => anotarFalla("avisos banco: " + e.message)); },
-    ajustes() {
-      if (!E.motor) return "";
-      const dias = diasDesde(E.respaldo), movs = contarMovs(true), pend = porEnviar().length;
-      const estadoResp = E.respaldo ? "Último respaldo: hace " + (dias === 0 ? "menos de un día" : dias + (dias === 1 ? " día" : " días")) + "." : "Todavía no has hecho un respaldo.";
-      const urgente = movs && (dias === null || dias >= DIAS_AVISO_RESPALDO);
-      return '<h2>Respaldo</h2><div class="card" style="padding:14px 16px">' +
-        '<p class="ayuda" style="margin:0 0 10px">Tus datos viven solo en este teléfono. Si se borra el navegador o cambias de celular, sin respaldo se pierden. El archivo de respaldo va cifrado con una contraseña que eliges. ' +
-        '<b' + (urgente ? ' style="color:var(--warn)"' : "") + ">" + esc(estadoResp) + "</b></p>" +
-        '<div class="acc" style="margin:0"><button class="btn btn-p btn-bloque" onclick="FALocal.respaldar(this)"><i class="ti ti-download"></i>Guardar respaldo</button>' +
-        '<button class="btn btn-bloque" onclick="FALocal.restaurar(this)"><i class="ti ti-upload"></i>Restaurar un respaldo</button></div>' + bloqueAuto() + '</div>' +
-
-        '<h2>Clave y cifrado</h2><div class="card" style="padding:14px 16px">' +
-        '<p class="ayuda" style="margin:0 0 10px">Tus datos se guardan cifrados (AES-256) en este teléfono: sin tu clave no se pueden leer, aunque alguien copie el almacenamiento. ' +
-        "La app la pide al abrirla y al volver después de un minuto. Una clave con letras y números es mucho más difícil de adivinar que solo números.</p>" +
-        '<button class="btn btn-bloque" onclick="FALocal.formClave()"><i class="ti ti-key"></i>Cambiar clave</button>' + bloqueHuella() + "</div>" +
-
-        bloqueAvisos() + bloqueAvisosBanco() + bloqueApplePay() +
-
-        '<h2>Atajos</h2><div class="card" style="padding:14px 16px"><p class="ayuda" style="margin:0 0 10px">' +
-        (PLATAFORMA === "ios" ? "iPhone: mantén presionado el ícono de Mis Finanzas y elige <i>Anotar gasto</i> o <i>Anotar ingreso</i>. "
-                              : "Android: mantén presionado el ícono de Mis Finanzas y elige <i>Anotar gasto</i> o <i>Anotar ingreso</i> (arrástralo a la pantalla de inicio para tenerlo a mano). ") +
-        "Desde un atajo anotas <b>sin escribir tu clave</b>: lo anotado queda cifrado y se suma a tus cuentas la próxima vez que entres. " +
-        "Para la app Atajos del iPhone o un widget de Android («Abrir URL»), copia el enlace de lo que anotas seguido: anota con un toque.</p>" +
-        ((window.D && window.D.recientes && window.D.recientes.length) ? '<div class="lista">' + window.D.recientes.map((x, i) =>
-          '<button class="fila toca" onclick="FALocal.copiarAtajo(' + i + ')"><span style="flex:1;min-width:0"><b>' + esc(x.nota || x.categoria) + '</b><small style="display:block;color:var(--t3)">' +
-          esc(x.tipo + " · $" + Number(x.monto).toLocaleString("es-CL") + (x.medio ? " · " + x.medio : "")) + '</small></span><i class="ti ti-copy"></i></button>').join("") + "</div>"
-          : '<p class="ayuda" style="margin:0">Cuando anotes algo igual dos veces (por ejemplo, el café), aparecerá aquí para copiar su enlace.</p>') +
-        '<button class="btn btn-bloque" style="margin-top:10px" onclick="FALocal.copiar(FALocal.enlace({}))"><i class="ti ti-link"></i>Copiar enlace «Anotar gasto»</button>' +
-        '<label style="display:flex;gap:12px;align-items:center;min-height:44px;margin-top:12px;cursor:pointer;font-weight:600">' +
-        '<input type="checkbox" id="fa-nombres" style="width:22px;height:22px;flex:none;accent-color:var(--a)" onchange="FALocal.nombresAtajo(this.checked)"' + (E.nombresAtajo === false ? "" : " checked") + ">" +
-        "<span>Mostrar mis categorías en el atajo</span></label>" +
-        '<p class="ayuda" style="margin:4px 0 0">Para elegirlas sin clave, los nombres de tus categorías y medios de pago quedan legibles en este teléfono (nunca montos ni movimientos). ' +
-        "Si lo apagas, el atajo pide solo monto y nota, y eliges la categoría al entrar.</p></div>" +
-
-        (NATIVO ? "" : '<h2>Copia en tu planilla de Google (opcional)</h2><div class="card" style="padding:14px 16px">' +
-        '<p class="ayuda" style="margin:0 0 10px">No hace falta: la app funciona sola. Si además usas Mis Finanzas en Google Sheets, pega el enlace de tu panel (termina en /exec) y envía los movimientos nuevos. ' +
-        "Se envían solo los movimientos (no metas, tarjetas ni cambios posteriores); las categorías, tarjetas, metas y deudas deben existir también en la planilla.</p>" +
-        '<div class="campo"><label for="fa-planilla">Enlace de tu panel</label><input class="inp" id="fa-planilla" type="url" inputmode="url" autocomplete="off" placeholder="https://script.google.com/macros/s/…/exec" value="' + esc(E.planilla) + '"></div>' +
-        '<div class="error" id="fa-planilla-err"></div>' +
-        (E.errores.length ? '<p class="ayuda" style="color:var(--bad);margin:6px 0">No se pudieron enviar: ' + E.errores.slice(0, 5).map(x => esc(x.error)).join(" · ") + (E.errores.length > 5 ? "…" : "") + "</p>" : "") +
-        '<button class="btn btn-bloque" onclick="FALocal.enviar(this)"><i class="ti ti-cloud-upload"></i>' + (pend ? "Enviar " + pend + (pend === 1 ? " movimiento nuevo" : " movimientos nuevos") : "Enviar a la planilla") + "</button></div>") +
-
-        '<h2>¿Algo no funcionó?</h2><div class="card" style="padding:14px 16px">' +
-        '<p class="ayuda" style="margin:0 0 10px">Cuéntanos qué pasó y envíalo por WhatsApp o correo. El reporte lleva la versión, el tipo de teléfono y los errores técnicos recientes (' + FALLAS.length + "); nunca tus datos ni montos.</p>" +
-        '<div class="campo"><label for="fa-rep">Qué hacías y qué pasó</label><textarea class="inp" id="fa-rep" rows="3" maxlength="1000" style="min-height:88px;resize:vertical"></textarea></div>' +
-        '<button class="btn btn-bloque" onclick="FALocal.reportar(this)"><i class="ti ti-message-report"></i>Enviar reporte</button></div>';
-    },
 
     respaldar() {
       window.abrirHoja("Guardar respaldo",
